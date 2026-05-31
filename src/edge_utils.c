@@ -309,14 +309,25 @@ int supernode_connect (n2n_edge_t *eee) {
 #ifdef _WIN32
             u_long value = 1;
             ioctlsocket(eee->sock, FIONBIO, &value);
+            if(connect(eee->sock, (struct sockaddr*)&(sn_sock), sizeof(struct sockaddr)) < 0) {
+                int wsa_error = WSAGetLastError();
+                if((wsa_error != WSAEWOULDBLOCK) && (wsa_error != WSAEINPROGRESS)) {
+                    traceEvent(TRACE_ERROR, "failed to initiate TCP connection to supernode [WSA error %d]", wsa_error);
+                    closesocket(eee->sock);
+                    eee->sock = -1;
+                    return -1;
+                }
+            }
 #else
             fcntl(eee->sock, F_SETFL, O_NONBLOCK);
-#endif
             if((connect(eee->sock, (struct sockaddr*)&(sn_sock), sizeof(struct sockaddr)) < 0)
                && (errno != EINPROGRESS)) {
+                traceEvent(TRACE_ERROR, "failed to initiate TCP connection to supernode [%s]", strerror(errno));
+                closesocket(eee->sock);
                 eee->sock = -1;
                 return -1;
             }
+#endif
         }
 
         if(eee->conf.tos) {
@@ -1067,9 +1078,13 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
         return sent;
     }
 
-    // We only get here if sendto failed, so errno must be valid
-
-    char * errstr = strerror(errno);
+    // We only get here if sendto failed. On Windows, Winsock keeps the
+    // authoritative error code in WSAGetLastError() rather than errno.
+    int sock_errno = errno;
+#ifdef _WIN32
+    int wsa_error = WSAGetLastError();
+#endif
+    char * errstr = strerror(sock_errno);
     n2n_sock_str_t sockbuf;
 
     if(!errstr) {
@@ -1079,15 +1094,19 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
     int level = TRACE_WARNING;
     // downgrade to TRACE_DEBUG in case of custom AF_INVALID,
     // i.e. supernode not resolved yet
-    if(errno == EAFNOSUPPORT /* 93 */) {
+    if(sock_errno == EAFNOSUPPORT /* 93 */
+#ifdef _WIN32
+       || wsa_error == WSAEAFNOSUPPORT
+#endif
+      ) {
         level = TRACE_DEBUG;
     }
 
     traceEvent(level, "sendto(%s) failed (%d) %s",
             sock_to_cstr(sockbuf, n2ndest),
-            errno, errstr);
+            sock_errno, errstr);
 #ifdef _WIN32
-    traceEvent(level, "WSAGetLastError(): %u", WSAGetLastError());
+    traceEvent(level, "WSAGetLastError(): %u", wsa_error);
 #endif
 
     /*

@@ -52,19 +52,34 @@ SOCKET open_socket (int local_port, in_addr_t address, int type /* 0 = UDP, TCP 
     SOCKET sock_fd;
     struct sockaddr_in local_address;
     int sockopt;
+    int sock_type = (type == 0) ? SOCK_DGRAM : SOCK_STREAM;
 
-    if((int)(sock_fd = socket(PF_INET, ((type == 0) ? SOCK_DGRAM : SOCK_STREAM) , 0)) < 0) {
-        traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]\n",
+#ifdef _WIN32
+    sock_fd = socket(AF_INET, sock_type, (sock_type == SOCK_DGRAM) ? IPPROTO_UDP : IPPROTO_TCP);
+    if(sock_fd == INVALID_SOCKET) {
+        traceEvent(TRACE_ERROR, "Unable to create socket [WSA error %u]", WSAGetLastError());
+        return(-1);
+    }
+#else
+    if((int)(sock_fd = socket(AF_INET, sock_type, 0)) < 0) {
+        traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]",
                    strerror(errno), sock_fd);
         return(-1);
     }
+#endif
 
 #ifndef _WIN32
     /* fcntl(sock_fd, F_SETFL, O_NONBLOCK); */
-#endif
-
     sockopt = 1;
     setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&sockopt, sizeof(sockopt));
+#else
+    sockopt = 1;
+    if(sock_type == SOCK_DGRAM) {
+        setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&sockopt, sizeof(sockopt));
+    } else {
+        setsockopt(sock_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&sockopt, sizeof(sockopt));
+    }
+#endif
 
     memset(&local_address, 0, sizeof(local_address));
     local_address.sin_family = AF_INET;
@@ -72,7 +87,12 @@ SOCKET open_socket (int local_port, in_addr_t address, int type /* 0 = UDP, TCP 
     local_address.sin_addr.s_addr = htonl(address);
 
     if(bind(sock_fd,(struct sockaddr*) &local_address, sizeof(local_address)) == -1) {
-        traceEvent(TRACE_ERROR, "Bind error on local port %u [%s]\n", local_port, strerror(errno));
+#ifdef _WIN32
+        traceEvent(TRACE_ERROR, "Bind error on local port %u [WSA error %u]", local_port, WSAGetLastError());
+#else
+        traceEvent(TRACE_ERROR, "Bind error on local port %u [%s]", local_port, strerror(errno));
+#endif
+        closesocket(sock_fd);
         return(-1);
     }
 

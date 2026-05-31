@@ -837,7 +837,7 @@ static int loadFromCLI (int argc, char *argv[], n2n_edge_conf_t *conf, n2n_tunta
     u_char c;
 
     while ((c = getopt_long(argc, argv,
-                            "k:a:c:Eu:g:m:M:s:d:l:p:fvVhrt:i:I:J:P:S::DL:z::A::Hn:R:e:"
+                            "k:a:c:Eu:g:m:M:s:d:l:p:fvVhrt:i:I:J:P:S:DL:z::A::Hn:R:e:"
 #ifdef __linux__
                             "T:"
 #endif
@@ -1120,11 +1120,12 @@ int main (int argc, char* argv[]) {
     traceEvent(TRACE_NORMAL, "starting n2n edge %s %s", PACKAGE_VERSION, PACKAGE_BUILDDATE);
 
 #ifdef HAVE_LIBCRYPTO
-    traceEvent(TRACE_NORMAL, "using %s", OpenSSL_version(0));
+    traceEvent(TRACE_NORMAL, "using OpenSSL support");
 #endif
 
     traceEvent(TRACE_NORMAL, "using compression: %s.", compression_str(conf.compression));
     traceEvent(TRACE_NORMAL, "using %s cipher.", transop_str(conf.transop_id));
+    traceEvent(TRACE_NORMAL, "supernode transport: %s", conf.connect_tcp ? "TCP" : "UDP");
 
     /* Random seed */
     n2n_srand (n2n_seed());
