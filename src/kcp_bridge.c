@@ -32,6 +32,42 @@ static int n2n_kcp_raw_sendto (SOCKET fd, const uint8_t *buf, size_t len, const 
     return (int)sendto(fd, (const char*)buf, (int)len, 0, (struct sockaddr*)&peer_addr, sizeof(peer_addr));
 }
 
+static int n2n_kcp_recv_pending_ctx (n2n_kcp_ctx_t *ctx, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
+    int peeksize;
+    int recv_len;
+
+    if(out_len) *out_len = 0;
+    if(!ctx || !ctx->active || !ctx->kcp || !out_buf || !out_len)
+        return 0;
+
+    peeksize = ikcp_peeksize(ctx->kcp);
+    if(peeksize <= 0 || (size_t)peeksize > out_buf_size)
+        return 0;
+
+    recv_len = ikcp_recv(ctx->kcp, (char*)out_buf, peeksize);
+    if(recv_len < 0)
+        return 0;
+
+    *out_len = recv_len;
+    return 1;
+}
+
+static int n2n_kcp_wait_timeout_ms_ctx (const n2n_kcp_ctx_t *ctx, uint32_t current_ms, int default_ms) {
+    uint32_t next_update;
+    uint32_t delta;
+
+    if(!ctx || !ctx->active || !ctx->kcp)
+        return default_ms;
+
+    next_update = ikcp_check(ctx->kcp, current_ms);
+    delta = (next_update <= current_ms) ? 0u : (next_update - current_ms);
+
+    if(delta > (uint32_t)default_ms)
+        return default_ms;
+
+    return (int)delta;
+}
+
 uint32_t n2n_kcp_now_ms (void) {
     return (uint32_t)(time_stamp() >> 12);
 }
@@ -115,15 +151,28 @@ int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, con
     if(ikcp_input(eee->sn_kcp.kcp, (const char*)buf, (long)len) < 0) return 0;
     eee->sn_kcp.last_seen = now;
     ikcp_update(eee->sn_kcp.kcp, n2n_kcp_now_ms());
-    *out_len = ikcp_recv(eee->sn_kcp.kcp, (char*)out_buf, (int)out_buf_size);
-    if(*out_len < 0) *out_len = 0;
-    return 1;
+    return n2n_kcp_recv_pending_ctx(&eee->sn_kcp, out_buf, out_buf_size, out_len);
+}
+
+int n2n_kcp_edge_recv_pending (n2n_edge_t *eee, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
+    if(out_len) *out_len = 0;
+    if(!eee)
+        return 0;
+
+    return n2n_kcp_recv_pending_ctx(&eee->sn_kcp, out_buf, out_buf_size, out_len);
 }
 
 void n2n_kcp_edge_update (n2n_edge_t *eee) {
     if(eee && eee->sn_kcp.active && eee->sn_kcp.kcp) {
         ikcp_update(eee->sn_kcp.kcp, n2n_kcp_now_ms());
     }
+}
+
+int n2n_kcp_edge_wait_timeout_ms (const n2n_edge_t *eee, int default_ms) {
+    if(!eee)
+        return default_ms;
+
+    return n2n_kcp_wait_timeout_ms_ctx(&eee->sn_kcp, n2n_kcp_now_ms(), default_ms);
 }
 
 static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *sender_sock, socklen_t sender_len) {
@@ -181,9 +230,24 @@ int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock,
     if(rc < 0) return 0;
     ctx->last_seen = now;
     ikcp_update(ctx->kcp, n2n_kcp_now_ms());
-    *out_len = ikcp_recv(ctx->kcp, (char*)out_buf, (int)out_buf_size);
-    if(*out_len < 0) *out_len = 0;
-    return 1;
+    return n2n_kcp_recv_pending_ctx(ctx, out_buf, out_buf_size, out_len);
+}
+
+int n2n_kcp_sn_recv_pending (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
+    n2n_kcp_ctx_t *ctx;
+    n2n_sock_t remote;
+
+    if(out_len) *out_len = 0;
+    if(!sss || !sender_sock)
+        return 0;
+
+    fill_n2nsock(&remote, sender_sock);
+    HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), ctx);
+    if(!ctx)
+        return 0;
+
+    (void)sender_len;
+    return n2n_kcp_recv_pending_ctx(ctx, out_buf, out_buf_size, out_len);
 }
 
 void n2n_kcp_sn_update (n2n_sn_t *sss) {
@@ -199,4 +263,22 @@ void n2n_kcp_sn_update (n2n_sn_t *sss) {
             free(ctx);
         }
     }
+}
+
+int n2n_kcp_sn_wait_timeout_ms (const n2n_sn_t *sss, int default_ms) {
+    const n2n_kcp_ctx_t *ctx;
+    const n2n_kcp_ctx_t *tmp;
+    int wait_ms = default_ms;
+    uint32_t current_ms = n2n_kcp_now_ms();
+
+    if(!sss)
+        return default_ms;
+
+    HASH_ITER(hh, sss->udp_kcp_connections, ctx, tmp) {
+        int ctx_wait_ms = n2n_kcp_wait_timeout_ms_ctx(ctx, current_ms, default_ms);
+        if(ctx_wait_ms < wait_ms)
+            wait_ms = ctx_wait_ms;
+    }
+
+    return wait_ms;
 }

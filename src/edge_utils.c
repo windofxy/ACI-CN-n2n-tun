@@ -220,6 +220,9 @@ static int is_ip6_discovery (const void * buf, size_t bufsize) {
 
 static int edge_transport_uses_tcp (const n2n_edge_t *eee);
 static void edge_set_active_transport (n2n_edge_t *eee, n2n_sn_transport_t transport);
+static void tcp_enable_low_latency (SOCKET sockfd);
+static void tcp_begin_packet_send (SOCKET sockfd);
+static void tcp_end_packet_send (SOCKET sockfd);
 
 
 // reset number of supernode connection attempts: try only once for already more realiable tcp connections
@@ -301,6 +304,41 @@ static void edge_set_active_transport (n2n_edge_t *eee, n2n_sn_transport_t trans
 
     eee->active_sn_transport = (uint8_t)transport;
     edge_sync_active_socket(eee);
+}
+
+
+static void tcp_enable_low_latency (SOCKET sockfd) {
+
+    int value = 1;
+
+    if(sockfd < 0)
+        return;
+
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
+}
+
+
+static void tcp_begin_packet_send (SOCKET sockfd) {
+
+    tcp_enable_low_latency(sockfd);
+#ifdef LINUX
+    {
+        int value = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
+    }
+#endif
+}
+
+
+static void tcp_end_packet_send (SOCKET sockfd) {
+
+    tcp_enable_low_latency(sockfd);
+#ifdef LINUX
+    {
+        int value = 0;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
+    }
+#endif
 }
 
 
@@ -473,6 +511,7 @@ static int supernode_connect_tcp_socket (n2n_edge_t *eee) {
 #endif
 
     supernode_apply_socket_options(eee, eee->tcp_sock);
+    tcp_enable_low_latency(eee->tcp_sock);
     if(eee->udp_sock < 0)
         supernode_update_local_socket(eee, eee->tcp_sock);
 
@@ -1328,7 +1367,6 @@ static void sendto_sock (n2n_edge_t *eee, const void * buf,
 
     struct sockaddr_in peer_addr;
     ssize_t sent;
-    int value = 0;
 
     // TODO: audit callers and confirm if this can ever happen
     if(!eee) {
@@ -1349,12 +1387,7 @@ static void sendto_sock (n2n_edge_t *eee, const void * buf,
 
     // if the connection is tcp, i.e. not the regular sock...
     if(edge_transport_uses_tcp(eee)) {
-
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
-        value = 1;
-#ifdef LINUX
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
-#endif
+        tcp_begin_packet_send(eee->sock);
 
         // prepend packet length...
         uint16_t pktsize16 = htobe16(len);
@@ -1368,12 +1401,7 @@ static void sendto_sock (n2n_edge_t *eee, const void * buf,
 
     // if the connection is tcp, i.e. not the regular sock...
     if(edge_transport_uses_tcp(eee)) {
-        value = 1; /* value should still be set to 1 */
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
-#ifdef LINUX
-        value = 0;
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
-#endif
+        tcp_end_packet_send(eee->sock);
     }
 
     return;
@@ -3051,8 +3079,10 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                 if(n2n_kcp_edge_input(eee, sender_sock, pktbuf, bread, now, kcp_out, sizeof(kcp_out), &kcp_out_len)) {
                     if(eee->tcp_fallback_active)
                         edge_mark_kcp_recovered(eee, "received KCP packet from supernode");
-                    if(kcp_out_len > 0) {
+                    while(kcp_out_len > 0) {
                         process_udp(eee, sender_sock, sock, kcp_out, kcp_out_len, now);
+                        if(!n2n_kcp_edge_recv_pending(eee, kcp_out, sizeof(kcp_out), &kcp_out_len))
+                            break;
                     }
                 } else {
                     process_udp(eee, sender_sock, sock, pktbuf, bread, now);
@@ -3185,8 +3215,9 @@ int run_edge_loop (n2n_edge_t *eee) {
 #endif
 
         if(eee->sn_kcp.active) {
-            wait_time.tv_sec = 0;
-            wait_time.tv_usec = 10000;
+            int wait_ms = n2n_kcp_edge_wait_timeout_ms(eee, 10);
+            wait_time.tv_sec = wait_ms / 1000;
+            wait_time.tv_usec = (wait_ms % 1000) * 1000;
         } else {
             wait_time.tv_sec = (eee->sn_wait) ? (SOCKET_TIMEOUT_INTERVAL_SECS / 10 + 1) : (SOCKET_TIMEOUT_INTERVAL_SECS);
             wait_time.tv_usec = 0;

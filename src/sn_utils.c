@@ -62,8 +62,46 @@ static ssize_t sendto_peer (n2n_sn_t *sss,
                             const struct peer_info *peer,
                             const uint8_t *pktbuf,
                             size_t pktsize);
+static void tcp_enable_low_latency (SOCKET sockfd);
+static void tcp_begin_packet_send (SOCKET sockfd);
+static void tcp_end_packet_send (SOCKET sockfd);
 
 static uint16_t reg_lifetime (n2n_sn_t *sss);
+
+
+static void tcp_enable_low_latency (SOCKET sockfd) {
+
+    int value = 1;
+
+    if(sockfd < 0)
+        return;
+
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
+}
+
+
+static void tcp_begin_packet_send (SOCKET sockfd) {
+
+    tcp_enable_low_latency(sockfd);
+#ifdef LINUX
+    {
+        int value = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
+    }
+#endif
+}
+
+
+static void tcp_end_packet_send (SOCKET sockfd) {
+
+    tcp_enable_low_latency(sockfd);
+#ifdef LINUX
+    {
+        int value = 0;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
+    }
+#endif
+}
 
 static int update_edge (n2n_sn_t *sss,
                         const n2n_common_t* cmn,
@@ -548,16 +586,10 @@ static ssize_t sendto_sock(n2n_sn_t *sss,
                            size_t pktsize) {
 
     ssize_t sent = 0;
-    int value = 0;
 
     // if the connection is tcp, i.e. not the regular sock...
     if((socket_fd >= 0) && (socket_fd != sss->sock)) {
-
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
-        value = 1;
-#ifdef LINUX
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
-#endif
+        tcp_begin_packet_send(socket_fd);
 
         // prepend packet length...
         uint16_t pktsize16 = htobe16(pktsize);
@@ -572,12 +604,7 @@ static ssize_t sendto_sock(n2n_sn_t *sss,
 
     // if the connection is tcp, i.e. not the regular sock...
     if((socket_fd >= 0) && (socket_fd != sss->sock)) {
-        value = 1; /* value should still be set to 1 */
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
-#ifdef LINUX
-        value = 0;
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
-#endif
+        tcp_end_packet_send(socket_fd);
     }
 
     return sent;
@@ -2642,8 +2669,9 @@ int run_sn_loop (n2n_sn_t *sss) {
 #endif
 
         if(sss->udp_kcp_connections) {
-            wait_time.tv_sec = 0;
-            wait_time.tv_usec = 10000;
+            int wait_ms = n2n_kcp_sn_wait_timeout_ms(sss, 10);
+            wait_time.tv_sec = wait_ms / 1000;
+            wait_time.tv_usec = (wait_ms % 1000) * 1000;
         } else {
             wait_time.tv_sec = 10;
             wait_time.tv_usec = 0;
@@ -2689,8 +2717,10 @@ int run_sn_loop (n2n_sn_t *sss) {
                     uint8_t kcp_out[N2N_SN_PKTBUF_SIZE];
                     ssize_t kcp_out_len = 0;
                     if(n2n_kcp_sn_process_input(sss, sender_sock, ss_size, pktbuf, bread, now, kcp_out, sizeof(kcp_out), &kcp_out_len)) {
-                        if(kcp_out_len > 0) {
+                        while(kcp_out_len > 0) {
                             process_udp(sss, sender_sock, ss_size, sss->sock, kcp_out, kcp_out_len, now);
+                            if(!n2n_kcp_sn_recv_pending(sss, sender_sock, ss_size, kcp_out, sizeof(kcp_out), &kcp_out_len))
+                                break;
                         }
                     } else {
                         process_udp(sss, sender_sock, ss_size, sss->sock, pktbuf, bread, now);
@@ -2774,6 +2804,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                     if(tmp_sock >= 0) {
                         conn = (n2n_tcp_connection_t*)calloc(1, sizeof(n2n_tcp_connection_t));
                         if(conn) {
+                            tcp_enable_low_latency(tmp_sock);
                             conn->socket_fd = tmp_sock;
                             memcpy(&(conn->sock), sender_sock, ss_size);
                             conn->sock_len = ss_size;
