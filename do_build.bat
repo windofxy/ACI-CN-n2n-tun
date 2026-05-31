@@ -93,11 +93,22 @@ set FAIL=0
 
 echo === Compiling core sources ===
 echo.
+<nul set /p="  thirdparty\kcp\ikcp.c ... "
+"%CC%" %CFLAGS% %INCLUDES% %FLAGS% -c "%SRC%/thirdparty/kcp/ikcp.c" -o "%BUILD%\ikcp.o" 2>"%BUILD%\ikcp.err"
+if errorlevel 1 (
+    echo FAILED
+    set /a FAIL+=1
+) else (
+    echo OK
+    set /a OK+=1
+    del /q "%BUILD%\ikcp.err" 2>nul
+)
 
+echo.
 for %%F in (
     aes.c auth.c cc20.c curve25519.c
     edge_management.c edge_utils.c header_encryption.c
-    hexdump.c json.c management.c minilzo.c
+    hexdump.c json.c kcp_bridge.c management.c minilzo.c
     n2n.c n2n_port_mapping.c n2n_regex.c
     network_traffic_filter.c pearson.c random_numbers.c
     sn_management.c sn_selection.c sn_utils.c speck.c
@@ -117,6 +128,7 @@ for %%F in (
     )
 )
 
+echo.
 echo.
 echo === Compiling Windows sources ===
 echo.
@@ -193,7 +205,7 @@ echo.
 echo === Linking supernode.exe ===
 echo.
 REM Exclude edge.o and supernode_main.o conflict - use all library .o except edge.o
-"%CC%" -o "%BUILD%\supernode.exe" "%BUILD%\supernode_main.o" "%BUILD%\aes.o" "%BUILD%\auth.o" "%BUILD%\cc20.o" "%BUILD%\curve25519.o" "%BUILD%\edge_management.o" "%BUILD%\edge_utils.o" "%BUILD%\header_encryption.o" "%BUILD%\hexdump.o" "%BUILD%\json.o" "%BUILD%\management.o" "%BUILD%\minilzo.o" "%BUILD%\n2n.o" "%BUILD%\n2n_port_mapping.o" "%BUILD%\n2n_regex.o" "%BUILD%\network_traffic_filter.o" "%BUILD%\pearson.o" "%BUILD%\random_numbers.o" "%BUILD%\sn_management.o" "%BUILD%\sn_selection.o" "%BUILD%\sn_utils.o" "%BUILD%\speck.o" "%BUILD%\tf.o" "%BUILD%\transform_aes.o" "%BUILD%\transform_cc20.o" "%BUILD%\transform_lzo.o" "%BUILD%\transform_null.o" "%BUILD%\transform_speck.o" "%BUILD%\transform_tf.o" "%BUILD%\transform_zstd.o" "%BUILD%\wire.o" "%BUILD%\wintap.o" "%BUILD%\edge_utils_win32.o" "%BUILD%\getopt.o" "%BUILD%\getopt1.o" "%BUILD%\wintun_device.o" %LDLIBS% 2>"%BUILD%\link_sn.err"
+"%CC%" -o "%BUILD%\supernode.exe" "%BUILD%\supernode_main.o" "%BUILD%\aes.o" "%BUILD%\auth.o" "%BUILD%\cc20.o" "%BUILD%\curve25519.o" "%BUILD%\edge_management.o" "%BUILD%\ikcp.o" "%BUILD%\kcp_bridge.o" "%BUILD%\edge_utils.o" "%BUILD%\header_encryption.o" "%BUILD%\hexdump.o" "%BUILD%\json.o" "%BUILD%\management.o" "%BUILD%\minilzo.o" "%BUILD%\n2n.o" "%BUILD%\n2n_port_mapping.o" "%BUILD%\n2n_regex.o" "%BUILD%\network_traffic_filter.o" "%BUILD%\pearson.o" "%BUILD%\random_numbers.o" "%BUILD%\sn_management.o" "%BUILD%\sn_selection.o" "%BUILD%\sn_utils.o" "%BUILD%\speck.o" "%BUILD%\tf.o" "%BUILD%\transform_aes.o" "%BUILD%\transform_cc20.o" "%BUILD%\transform_lzo.o" "%BUILD%\transform_null.o" "%BUILD%\transform_speck.o" "%BUILD%\transform_tf.o" "%BUILD%\transform_zstd.o" "%BUILD%\wire.o" "%BUILD%\wintap.o" "%BUILD%\edge_utils_win32.o" "%BUILD%\getopt.o" "%BUILD%\getopt1.o" "%BUILD%\wintun_device.o" %LDLIBS% 2>"%BUILD%\link_sn.err"
 if errorlevel 1 (
     echo Linking supernode FAILED!
     type "%BUILD%\link_sn.err"

@@ -53,6 +53,7 @@
 #include <stdio.h>         // for size_t, FILE
 #include "n2n_define.h"
 #include "n2n_typedefs.h"
+#include "../thirdparty/kcp/ikcp.h"
 
 #ifdef _WIN32
 #include <winsock2.h>           /* for tcp */
@@ -159,6 +160,19 @@ SOCKET open_socket (int local_port, in_addr_t address, int type);
 int sock_equal (const n2n_sock_t * a,
                 const n2n_sock_t * b);
 
+/* KCP */
+uint32_t n2n_kcp_now_ms (void);
+uint32_t n2n_kcp_conv_for_sock (const n2n_sock_t *sock);
+void n2n_kcp_ctx_init (n2n_kcp_ctx_t *ctx);
+void n2n_kcp_ctx_term (n2n_kcp_ctx_t *ctx);
+int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote);
+int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2n_sock_t *dest);
+int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
+void n2n_kcp_edge_update (n2n_edge_t *eee);
+int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *socket, const uint8_t *pktbuf, size_t pktsize);
+int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
+void n2n_kcp_sn_update (n2n_sn_t *sss);
+
 /* Header encryption */
 uint64_t time_stamp (void);
 uint64_t initial_time_stamp (void);
@@ -198,6 +212,7 @@ void edge_read_from_tap (n2n_edge_t *eee);
 int edge_get_n2n_socket (n2n_edge_t *eee);
 int edge_get_management_socket (n2n_edge_t *eee);
 int run_edge_loop (n2n_edge_t *eee);
+int edge_switch_to_tcp_supernode (n2n_edge_t *eee, const char *reason);
 int quick_edge_init (char *device_name, char *community_name,
                      char *encrypt_key, char *device_mac,
                      char *local_ip_address,

@@ -38,8 +38,10 @@ set(N2N_LIB_SOURCES
     src/edge_utils.c
     src/header_encryption.c
     src/hexdump.c
+    src/kcp_bridge.c
     src/json.c
     src/management.c
+    thirdparty/kcp/ikcp.c
     src/minilzo.c
     src/n2n.c
     src/n2n_port_mapping.c

@@ -473,6 +473,21 @@ struct peer_info {
 
 typedef struct peer_info peer_info_t;
 
+typedef struct n2n_kcp_ctx {
+    struct IKCPCB                     *kcp;
+    n2n_sock_t                        remote_sock;
+    uint32_t                          conv;
+    uint8_t                           active;
+    time_t                            last_seen;
+
+    UT_hash_handle                    hh;
+} n2n_kcp_ctx_t;
+
+typedef enum n2n_sn_transport {
+    N2N_SN_TRANSPORT_UDP = 0,
+    N2N_SN_TRANSPORT_TCP = 1
+} n2n_sn_transport_t;
+
 #ifdef HAVE_BRIDGING_SUPPORT
 struct host_info {
     n2n_mac_t                        mac_addr;
@@ -722,9 +737,19 @@ struct n2n_edge {
 
     /* Sockets */
     /* supernode socket is in        eee->curr_sn->sock (of type n2n_sock_t) */
-    int                              sock;
+    int                              sock;                               /**< currently active supernode transport socket */
+    int                              udp_sock;                           /**< UDP socket to the active supernode */
+    int                              tcp_sock;                           /**< TCP socket to the active supernode */
     int                              close_socket_counter;               /**< counter for close-event before re-opening */
     int                              udp_mgmt_sock;                      /**< socket for status info. */
+    n2n_sock_t                       tcp_sn_sock;                        /**< supernode currently associated with tcp_sock */
+    uint8_t                          tcp_sn_sock_valid;                  /**< whether tcp_sn_sock tracks an active TCP peer */
+    uint8_t                          active_sn_transport;                /**< current supernode transport, see n2n_sn_transport_t */
+    uint8_t                          tcp_fallback_active;                /**< whether the edge temporarily fell back to TCP */
+    uint8_t                          kcp_probe_pending;                  /**< whether a KCP recovery probe is in flight */
+    n2n_cookie_t                     kcp_probe_cookie;                   /**< cookie associated with the outstanding KCP probe */
+    time_t                           last_kcp_probe;                     /**< last KCP recovery probe timestamp */
+    n2n_kcp_ctx_t                    sn_kcp;                             /**< KCP session for supernode UDP transport. */
 
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
     n2n_sock_t                       multicast_peer;                     /**< Multicast peer group (for local edges) */
@@ -847,6 +872,7 @@ typedef struct n2n_sn {
     int                                    tcp_sock;        /* auxiliary socket for optional TCP connections */
     n2n_tcp_connection_t                   *tcp_connections;/* list of established TCP connections */
     int                                    mgmt_sock;       /* management socket. */
+    n2n_kcp_ctx_t                          *udp_kcp_connections; /* KCP sessions carried over UDP. */
     n2n_ip_subnet_t                        min_auto_ip_net; /* Address range of auto_ip service. */
     n2n_ip_subnet_t                        max_auto_ip_net; /* Address range of auto_ip service. */
 #ifndef _WIN32

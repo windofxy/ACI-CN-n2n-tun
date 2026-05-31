@@ -80,7 +80,7 @@ int num_cap = sizeof(cap_values)/sizeof(cap_value_t);
 void send_register_super (n2n_edge_t *eee);
 void send_query_peer (n2n_edge_t *eee, const n2n_mac_t dst_mac);
 int supernode_connect (n2n_edge_t *eee);
-int supernode_disconnect (n2n_edge_t *eee);
+void supernode_disconnect (n2n_edge_t *eee);
 int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                                        uint8_t *pktbuf, uint16_t *expected, uint16_t *position,
                                        time_t now);
@@ -301,11 +301,11 @@ static void help (int level) {
         printf(" -e <local ip>     | advertises the provided local IP address as preferred,\n"
                "                   | useful if multicast peer detection is not available,\n"
                "                   | '-e auto' tries IP address auto-detection\n");
-        printf(" -S1 ... -S2       | do not connect p2p, always use the supernode,\n"
+        printf(" -S1 ... -S3       | do not connect p2p, always use the supernode,\n"
                "                   | -S1 = via UDP"
 
 #ifdef N2N_HAVE_TCP
-                                  ", -S2 = via TCP"
+                                  ", -S2 = via TCP, -S3 = hybrid UDP/KCP with TCP fallback"
 #endif
 "\n");
         printf(" -i <reg_interval> | registration interval, for NAT hole punching (default\n"
@@ -722,7 +722,7 @@ static int setOption (int optkey, char *optargument, n2n_tuntap_priv_config_t *e
                 solitude = atoi(optargument);
             } else {
                 traceEvent(TRACE_WARNING, "the use of the solitary -S switch is deprecated and will not be supported in future versions, "
-                           "please use -S1 instead to choose supernode-only connection via UDP");
+                           "please use -S1 instead to choose supernode-only connection via UDP/KCP");
 
                 solitude = 1;
             }
@@ -733,6 +733,8 @@ static int setOption (int optkey, char *optargument, n2n_tuntap_priv_config_t *e
 #ifdef N2N_HAVE_TCP
             if(solitude == 2)
                 conf->connect_tcp = 1;
+            else if(solitude == 3)
+                conf->connect_tcp = 0;
 #endif
             break;
         }
@@ -1241,16 +1243,22 @@ int main (int argc, char* argv[]) {
                 traceEvent(TRACE_NORMAL, "received REGISTER_SUPER_ACK from supernode for IP address asignment");
                 // it should be from curr_sn, but we can't determine definitely here, so no details to output
             } else if(last_action <= (now - BOOTSTRAP_TIMEOUT)) {
-                // timeout, so try next supernode
-                if(eee->curr_sn->hh.next)
-                    eee->curr_sn = eee->curr_sn->hh.next;
-                else
-                    eee->curr_sn = eee->conf.supernodes;
-                supernode_connect(eee);
-                runlevel--;
-                // skip waiting for answer to direcly go to send REGISTER_SUPER again
-                seek_answer = 0;
-                traceEvent(TRACE_DEBUG, "REGISTER_SUPER_ACK timeout");
+                if(edge_switch_to_tcp_supernode(eee, "bootstrap REGISTER_SUPER_ACK timeout")) {
+                    runlevel--;
+                    seek_answer = 0;
+                    traceEvent(TRACE_WARNING, "REGISTER_SUPER_ACK timeout on UDP/KCP, retrying over TCP");
+                } else {
+                    // timeout, so try next supernode
+                    if(eee->curr_sn->hh.next)
+                        eee->curr_sn = eee->curr_sn->hh.next;
+                    else
+                        eee->curr_sn = eee->conf.supernodes;
+                    supernode_connect(eee);
+                    runlevel--;
+                    // skip waiting for answer to direcly go to send REGISTER_SUPER again
+                    seek_answer = 0;
+                    traceEvent(TRACE_DEBUG, "REGISTER_SUPER_ACK timeout");
+                }
             }
         }
 

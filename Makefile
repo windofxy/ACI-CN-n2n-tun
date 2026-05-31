@@ -70,8 +70,10 @@ N2N_OBJS=\
 	src/edge_utils.o \
 	src/header_encryption.o \
 	src/hexdump.o \
+	src/kcp_bridge.o \
 	src/json.o \
 	src/management.o \
+	thirdparty/kcp/ikcp.o \
 	src/minilzo.o \
 	src/n2n.o \
 	src/n2n_port_mapping.o \

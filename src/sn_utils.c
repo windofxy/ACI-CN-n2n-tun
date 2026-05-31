@@ -505,6 +505,14 @@ static ssize_t sendto_fd (n2n_sn_t *sss,
     ssize_t sent = 0;
     n2n_tcp_connection_t *conn;
 
+    if(socket_fd == sss->sock) {
+        int kcp_sent = n2n_kcp_sn_send(sss, socket_fd, socket, pktbuf, pktsize);
+        if(kcp_sent >= 0) {
+            traceEvent(TRACE_DEBUG, "sendto sent=%d to ", kcp_sent);
+            return kcp_sent;
+        }
+    }
+
     sent = sendto(socket_fd, (void *)pktbuf, pktsize, 0 /* flags */,
                   socket, sizeof(struct sockaddr_in));
 
@@ -838,6 +846,8 @@ int sn_init_defaults (n2n_sn_t *sss) {
 /** Initialise the supernode */
 void sn_init (n2n_sn_t *sss) {
 
+    sss->udp_kcp_connections = NULL;
+
     if(resolve_create_thread(&(sss->resolve_parameter), sss->federation->edges) == 0) {
          traceEvent(TRACE_NORMAL, "successfully created resolver thread");
     }
@@ -852,6 +862,7 @@ void sn_term (n2n_sn_t *sss) {
     struct sn_community_regular_expression *re, *tmp_re;
     n2n_tcp_connection_t *conn, *tmp_conn;
     node_supernode_association_t *assoc, *tmp_assoc;
+    n2n_kcp_ctx_t *kcp_ctx, *tmp_kcp_ctx;
 
     resolve_cancel_thread(sss->resolve_parameter);
 
@@ -859,6 +870,12 @@ void sn_term (n2n_sn_t *sss) {
         closesocket(sss->sock);
     }
     sss->sock = -1;
+
+    HASH_ITER(hh, sss->udp_kcp_connections, kcp_ctx, tmp_kcp_ctx) {
+        HASH_DEL(sss->udp_kcp_connections, kcp_ctx);
+        n2n_kcp_ctx_term(kcp_ctx);
+        free(kcp_ctx);
+    }
 
     HASH_ITER(hh, sss->tcp_connections, conn, tmp_conn) {
         shutdown(conn->socket_fd, SHUT_RDWR);
@@ -2595,6 +2612,7 @@ int run_sn_loop (n2n_sn_t *sss) {
         int max_sock;
         fd_set socket_mask;
         n2n_tcp_connection_t *conn, *tmp_conn;
+        n2n_kcp_ctx_t *kcp_ctx, *tmp_kcp_ctx;
 
 #ifdef N2N_HAVE_TCP
         SOCKET tmp_sock;
@@ -2623,14 +2641,21 @@ int run_sn_loop (n2n_sn_t *sss) {
         }
 #endif
 
-        wait_time.tv_sec = 10;
-        wait_time.tv_usec = 0;
+        if(sss->udp_kcp_connections) {
+            wait_time.tv_sec = 0;
+            wait_time.tv_usec = 10000;
+        } else {
+            wait_time.tv_sec = 10;
+            wait_time.tv_usec = 0;
+        }
 
         before = time(NULL);
 
         rc = select(max_sock + 1, &socket_mask, NULL, NULL, &wait_time);
 
         now = time(NULL);
+
+        n2n_kcp_sn_update(sss);
 
         if(rc > 0) {
 
@@ -2661,7 +2686,15 @@ int run_sn_loop (n2n_sn_t *sss) {
                 // we have a datagram to process...
                 if(bread > 0) {
                     // ...and the datagram has data (not just a header)
-                    process_udp(sss, sender_sock, ss_size, sss->sock, pktbuf, bread, now);
+                    uint8_t kcp_out[N2N_SN_PKTBUF_SIZE];
+                    ssize_t kcp_out_len = 0;
+                    if(n2n_kcp_sn_process_input(sss, sender_sock, ss_size, pktbuf, bread, now, kcp_out, sizeof(kcp_out), &kcp_out_len)) {
+                        if(kcp_out_len > 0) {
+                            process_udp(sss, sender_sock, ss_size, sss->sock, kcp_out, kcp_out_len, now);
+                        }
+                    } else {
+                        process_udp(sss, sender_sock, ss_size, sss->sock, pktbuf, bread, now);
+                    }
                 }
             }
 
