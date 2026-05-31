@@ -6,3 +6,7 @@
     path = thirdparty/libnatpmp
     url = https://github.com/miniupnp/libnatpmp.git
     ignore = dirty
+[submodule "thirdparty/kcp"]
+    path = thirdparty/kcp
+    url = https://github.com/skywind3000/kcp
+    ignore = dirty
