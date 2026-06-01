@@ -10,6 +10,7 @@
 #define N2N_KCP_SNDBUF_WND 128
 #define N2N_KCP_RCVBUF_WND 128
 #define N2N_KCP_DEFAULT_MTU 1200
+#define N2N_KCP_OVERHEAD 24
 #define N2N_KCP_FIXED_CONV 0x4e324e31u
 
 typedef struct n2n_kcp_edge_output_ctx {
@@ -50,6 +51,13 @@ static int n2n_kcp_recv_pending_ctx (n2n_kcp_ctx_t *ctx, uint8_t *out_buf, size_
 
     *out_len = recv_len;
     return 1;
+}
+
+static int n2n_kcp_packet_matches_conv (const uint8_t *buf, size_t len, uint32_t conv) {
+    if(!buf || len < (size_t)N2N_KCP_OVERHEAD)
+        return 0;
+
+    return ikcp_getconv(buf) == conv;
 }
 
 static int n2n_kcp_wait_timeout_ms_ctx (const n2n_kcp_ctx_t *ctx, uint32_t current_ms, int default_ms) {
@@ -143,15 +151,20 @@ int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2
 
 int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
     n2n_sock_t sender;
+    uint32_t conv;
+
     if(out_len) *out_len = 0;
     if(!eee || eee->udp_sock < 0 || !out_buf || !out_len) return 0;
     fill_n2nsock(&sender, sender_sock);
     if(!sock_equal(&sender, &eee->curr_sn->sock)) return 0;
+    conv = n2n_kcp_conv_for_sock(&sender);
+    if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
     if(n2n_kcp_edge_setup(eee, &sender) != 0) return 0;
     if(ikcp_input(eee->sn_kcp.kcp, (const char*)buf, (long)len) < 0) return 0;
     eee->sn_kcp.last_seen = now;
     ikcp_update(eee->sn_kcp.kcp, n2n_kcp_now_ms());
-    return n2n_kcp_recv_pending_ctx(&eee->sn_kcp, out_buf, out_buf_size, out_len);
+    n2n_kcp_recv_pending_ctx(&eee->sn_kcp, out_buf, out_buf_size, out_len);
+    return 1;
 }
 
 int n2n_kcp_edge_recv_pending (n2n_edge_t *eee, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
@@ -221,16 +234,22 @@ int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *soc
 
 int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
     n2n_kcp_ctx_t *ctx;
+    n2n_sock_t remote;
+    uint32_t conv;
     int rc;
     if(out_len) *out_len = 0;
     if(!sss || !sender_sock || !buf || !out_buf || !out_len) return 0;
+    fill_n2nsock(&remote, sender_sock);
+    conv = n2n_kcp_conv_for_sock(&remote);
+    if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
     ctx = n2n_kcp_sn_find_or_create(sss, sss->sock, sender_sock, sender_len);
     if(!ctx) return 0;
     rc = ikcp_input(ctx->kcp, (const char*)buf, (long)len);
     if(rc < 0) return 0;
     ctx->last_seen = now;
     ikcp_update(ctx->kcp, n2n_kcp_now_ms());
-    return n2n_kcp_recv_pending_ctx(ctx, out_buf, out_buf_size, out_len);
+    n2n_kcp_recv_pending_ctx(ctx, out_buf, out_buf_size, out_len);
+    return 1;
 }
 
 int n2n_kcp_sn_recv_pending (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {

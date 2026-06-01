@@ -544,10 +544,17 @@ static ssize_t sendto_fd (n2n_sn_t *sss,
     n2n_tcp_connection_t *conn;
 
     if(socket_fd == sss->sock) {
-        int kcp_sent = n2n_kcp_sn_send(sss, socket_fd, socket, pktbuf, pktsize);
-        if(kcp_sent >= 0) {
-            traceEvent(TRACE_DEBUG, "sendto sent=%d to ", kcp_sent);
-            return kcp_sent;
+        n2n_sock_t remote;
+        n2n_kcp_ctx_t *kcp_ctx = NULL;
+
+        fill_n2nsock(&remote, socket);
+        HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), kcp_ctx);
+        if(kcp_ctx && kcp_ctx->active) {
+            int kcp_sent = n2n_kcp_sn_send(sss, socket_fd, socket, pktbuf, pktsize);
+            if(kcp_sent >= 0) {
+                traceEvent(TRACE_DEBUG, "sendto sent=%d to ", kcp_sent);
+                return kcp_sent;
+            }
         }
     }
 

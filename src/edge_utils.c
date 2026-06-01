@@ -380,15 +380,15 @@ static void supernode_disconnect_tcp (n2n_edge_t *eee) {
 }
 
 
-static void edge_mark_kcp_recovered (n2n_edge_t *eee, const char *reason) {
+static void edge_mark_udp_recovered (n2n_edge_t *eee, const char *reason) {
 
     if(!eee || edge_transport_is_forced_tcp(eee) || !eee->tcp_fallback_active)
         return;
 
-    traceEvent(TRACE_NORMAL, "UDP/KCP transport to supernode [%s] is available again, switching back from TCP",
+    traceEvent(TRACE_NORMAL, "UDP transport to supernode [%s] is available again, switching back from TCP",
                supernode_ip(eee));
     if(reason)
-    traceEvent(TRACE_INFO, "transport recovery detail: %s", reason);
+        traceEvent(TRACE_INFO, "transport recovery detail: %s", reason);
 
     eee->tcp_fallback_active = 0;
     eee->kcp_probe_pending = 0;
@@ -1290,7 +1290,7 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
         goto err_out;
     }
 
-    if((!edge_transport_uses_tcp(eee)) && n2ndest && sock_equal(n2ndest, &(eee->curr_sn->sock))) {
+    if((!edge_transport_uses_tcp(eee)) && eee->sn_kcp.active && n2ndest && sock_equal(n2ndest, &(eee->curr_sn->sock))) {
         int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
         if(kcp_sent >= 0) {
             traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
@@ -2796,6 +2796,9 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                            sock_to_cstr(sockbuf2, orig_sender),
                            (unsigned int)eee->sup_attempts);
 
+                if(eee->tcp_fallback_active && (eee->udp_sock >= 0) && (in_sock == eee->udp_sock))
+                    edge_mark_udp_recovered(eee, "received UDP REGISTER_SUPER_ACK from supernode");
+
                 if(is_null_mac(eee->curr_sn->mac_addr)) {
                     HASH_DEL(eee->conf.supernodes, eee->curr_sn);
                     memcpy(&eee->curr_sn->mac_addr, ra.srcMac, N2N_MAC_SIZE);
@@ -3078,7 +3081,7 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                 ssize_t kcp_out_len = 0;
                 if(n2n_kcp_edge_input(eee, sender_sock, pktbuf, bread, now, kcp_out, sizeof(kcp_out), &kcp_out_len)) {
                     if(eee->tcp_fallback_active)
-                        edge_mark_kcp_recovered(eee, "received KCP packet from supernode");
+                        edge_mark_udp_recovered(eee, "received KCP packet from supernode");
                     while(kcp_out_len > 0) {
                         process_udp(eee, sender_sock, sock, kcp_out, kcp_out_len, now);
                         if(!n2n_kcp_edge_recv_pending(eee, kcp_out, sizeof(kcp_out), &kcp_out_len))
