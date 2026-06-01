@@ -103,6 +103,7 @@ static void n2n_kcp_configure (ikcpcb *kcp) {
     ikcp_wndsize(kcp, N2N_KCP_SNDBUF_WND, N2N_KCP_RCVBUF_WND);
     ikcp_setmtu(kcp, N2N_KCP_DEFAULT_MTU);
     kcp->rx_minrto = 10;
+    kcp->dead_link = 7;
 }
 
 static int n2n_kcp_edge_output (const char *buf, int len, ikcpcb *kcp, void *user) {

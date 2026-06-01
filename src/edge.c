@@ -1313,6 +1313,18 @@ int main (int argc, char* argv[]) {
     eee->last_sweep = now - SWEEP_TIME + 2 * BOOTSTRAP_TIMEOUT;
     eee->sn_wait = 1;
     eee->last_register_req = 0;
+    eee->last_register_req_ms = 0;
+    eee->register_fast_retry_count = 0;
+    eee->tcp_register_soft_retry_budget = 0;
+    eee->register_super_soft_retry_armed = 0;
+    eee->register_super_request_active = 0;
+    eee->sending_supernode_control = 0;
+    eee->register_super_cookie = 0;
+    memset(&eee->register_super_auth, 0, sizeof(eee->register_super_auth));
+    eee->pending_packet_queue_head = NULL;
+    eee->pending_packet_queue_tail = NULL;
+    eee->pending_packet_queue_count = 0;
+    eee->pending_packet_queue_bytes = 0;
 
 #ifndef _WIN32
     if(eee->tuntap_priv_conf.daemon) {

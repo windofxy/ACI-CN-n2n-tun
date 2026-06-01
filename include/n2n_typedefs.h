@@ -498,6 +498,7 @@ struct host_info {
 #endif
 
 typedef struct n2n_edge n2n_edge_t;
+typedef struct n2n_packet_queue_entry n2n_packet_queue_entry_t;
 
 /* *************************************************** */
 
@@ -746,10 +747,24 @@ struct n2n_edge {
     uint8_t                          tcp_sn_sock_valid;                  /**< whether tcp_sn_sock tracks an active TCP peer */
     uint8_t                          active_sn_transport;                /**< current supernode transport, see n2n_sn_transport_t */
     uint8_t                          tcp_fallback_active;                /**< whether the edge temporarily fell back to TCP */
+    uint8_t                          tcp_sticky_after_fallback;          /**< whether TCP fallback should remain active until TCP disconnects */
     uint8_t                          kcp_probe_pending;                  /**< whether a KCP recovery probe is in flight */
     n2n_cookie_t                     kcp_probe_cookie;                   /**< cookie associated with the outstanding KCP probe */
     time_t                           last_kcp_probe;                     /**< last KCP recovery probe timestamp */
+    uint32_t                         last_register_req_ms;               /**< last REGISTER_SUPER send attempt time in ms */
+    uint8_t                          register_fast_retry_count;          /**< current fast retry backoff stage for REGISTER_SUPER */
+    uint8_t                          tcp_register_soft_retry_budget;     /**< remaining TCP soft retries for REGISTER_SUPER during fallback */
+    uint8_t                          sending_register_super;             /**< whether a REGISTER_SUPER send is currently in progress */
+    uint8_t                          register_super_soft_retry_armed;    /**< whether current REGISTER_SUPER send already consumed one TCP soft retry */
+    uint8_t                          register_super_request_active;      /**< whether current REGISTER_SUPER retry sequence reuses a fixed cookie/auth token */
+    uint8_t                          sending_supernode_control;          /**< whether current send is an allowed TCP fallback control-plane send */
+    n2n_cookie_t                     register_super_cookie;              /**< cookie reused across one REGISTER_SUPER retry sequence */
+    n2n_auth_t                       register_super_auth;                /**< auth token reused across one REGISTER_SUPER retry sequence */
     n2n_kcp_ctx_t                    sn_kcp;                             /**< KCP session for supernode UDP transport. */
+    n2n_packet_queue_entry_t         *pending_packet_queue_head;         /**< queued ethernet frames while fallback transport is establishing */
+    n2n_packet_queue_entry_t         *pending_packet_queue_tail;         /**< tail pointer for queued ethernet frames */
+    size_t                           pending_packet_queue_count;         /**< number of queued ethernet frames */
+    size_t                           pending_packet_queue_bytes;         /**< total bytes in queued ethernet frames */
 
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
     n2n_sock_t                       multicast_peer;                     /**< Multicast peer group (for local edges) */
