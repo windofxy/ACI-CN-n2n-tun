@@ -36,6 +36,7 @@
 #include "uthash.h"            // for UT_hash_handle, HASH_ITER, HASH_ADD_STR
 
 #ifdef _WIN32
+#include <timeapi.h>
 #include "win32/defs.h"
 #else
 #include <arpa/inet.h>         // for inet_addr
@@ -596,6 +597,9 @@ BOOL WINAPI term_handler (DWORD sig)
 int main (int argc, char * const argv[]) {
 
     int rc;
+#ifdef _WIN32
+    int timer_period_enabled = 0;
+#endif
 #ifndef _WIN32
     struct passwd *pw = NULL;
 #endif
@@ -735,8 +739,26 @@ int main (int argc, char * const argv[]) {
 #endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(term_handler, TRUE);
+
+    {
+        MMRESULT timer_result = timeBeginPeriod(1);
+
+        if(timer_result == TIMERR_NOERROR) {
+            timer_period_enabled = 1;
+            traceEvent(TRACE_INFO, "enabled 1ms Windows timer period for lower-latency KCP scheduling");
+        } else {
+            traceEvent(TRACE_WARNING, "timeBeginPeriod(1) failed: %u", (unsigned int)timer_result);
+        }
+    }
 #endif
 
     sss_node.keep_running = &keep_running;
-    return run_sn_loop(&sss_node);
+    rc = run_sn_loop(&sss_node);
+
+#ifdef _WIN32
+    if(timer_period_enabled)
+        timeEndPeriod(1);
+#endif
+
+    return rc;
 }

@@ -686,6 +686,7 @@ int fill_sockaddr (struct sockaddr * addr,
 // fills struct sockaddr's data into n2n_sock
 int fill_n2nsock (n2n_sock_t* sock, const struct sockaddr* sa) {
 
+    memset(sock, 0, sizeof(*sock));
     sock->family = sa->sa_family;
 
     switch(sock->family) {

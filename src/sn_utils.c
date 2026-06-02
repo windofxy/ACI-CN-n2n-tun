@@ -52,6 +52,17 @@
 
 
 #define HASH_FIND_COMMUNITY(head, name, out) HASH_FIND_STR(head, name, out)
+#define N2N_SN_LEGACY_SAFE_UDP_SIZE 2048
+#define N2N_SN_PENDING_PACKET_QUEUE_MAX_PACKETS 128
+#define N2N_SN_PENDING_PACKET_QUEUE_MAX_BYTES (1024 * 1024)
+#define N2N_SN_PENDING_PACKET_QUEUE_MAX_AGE_MS 2000
+
+struct n2n_packet_queue_entry {
+    struct n2n_packet_queue_entry *next;
+    uint32_t enqueue_ms;
+    uint16_t len;
+    uint8_t data[];
+};
 
 int resolve_create_thread (n2n_resolve_parameter_t **param, struct peer_info *sn_list);
 int resolve_check (n2n_resolve_parameter_t *param, uint8_t resolution_request, time_t now);
@@ -59,12 +70,17 @@ int resolve_cancel_thread (n2n_resolve_parameter_t *param);
 
 
 static ssize_t sendto_peer (n2n_sn_t *sss,
-                            const struct peer_info *peer,
+                            struct peer_info *peer,
                             const uint8_t *pktbuf,
-                            size_t pktsize);
+                            size_t pktsize,
+                            uint8_t queue_oversized_business_packet);
 static void tcp_enable_low_latency (SOCKET sockfd);
 static void tcp_begin_packet_send (SOCKET sockfd);
 static void tcp_end_packet_send (SOCKET sockfd);
+static void peer_clear_pending_packet_queue (struct peer_info *peer, const char *reason);
+static void free_peer_info (struct peer_info *peer);
+static void sn_flush_pending_packet_queue_by_sock (n2n_sn_t *sss, const struct sockaddr *sender_sock);
+static void sn_purge_all_pending_packet_queues (n2n_sn_t *sss);
 
 static uint16_t reg_lifetime (n2n_sn_t *sss);
 
@@ -101,6 +117,179 @@ static void tcp_end_packet_send (SOCKET sockfd) {
         setsockopt(sockfd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
     }
 #endif
+}
+
+
+static int peer_has_active_kcp (const n2n_sn_t *sss, const struct peer_info *peer) {
+
+    n2n_kcp_ctx_t *kcp_ctx = NULL;
+
+    if(!sss || !peer)
+        return 0;
+
+    if((peer->socket_fd >= 0) && (peer->socket_fd != sss->sock))
+        return 0;
+
+    HASH_FIND(hh, sss->udp_kcp_connections, &peer->sock, sizeof(n2n_sock_t), kcp_ctx);
+    return (kcp_ctx && kcp_ctx->active);
+}
+
+
+static void peer_drop_oldest_pending_packet (struct peer_info *peer, const char *reason) {
+
+    n2n_packet_queue_entry_t *entry;
+
+    if(!peer || !peer->pending_packet_queue_head)
+        return;
+
+    entry = peer->pending_packet_queue_head;
+    peer->pending_packet_queue_head = entry->next;
+    if(!peer->pending_packet_queue_head)
+        peer->pending_packet_queue_tail = NULL;
+
+    if(peer->pending_packet_queue_count > 0)
+        peer->pending_packet_queue_count--;
+    if(peer->pending_packet_queue_bytes >= entry->len)
+        peer->pending_packet_queue_bytes -= entry->len;
+    else
+        peer->pending_packet_queue_bytes = 0;
+
+    if(reason) {
+        traceEvent(TRACE_DEBUG,
+                   "dropping queued business packet of %u bytes (%s)",
+                   (unsigned int)entry->len,
+                   reason);
+    } else {
+        traceEvent(TRACE_DEBUG,
+                   "dropping queued business packet of %u bytes",
+                   (unsigned int)entry->len);
+    }
+
+    free(entry);
+}
+
+
+static void sn_handle_expired_pending_packets (n2n_sn_t *sss, struct peer_info *peer, uint32_t now_ms) {
+
+    n2n_sock_str_t sockbuf;
+
+    while(sss && peer && peer->pending_packet_queue_head) {
+        n2n_packet_queue_entry_t *entry = peer->pending_packet_queue_head;
+
+        if((uint32_t)(now_ms - entry->enqueue_ms) <= N2N_SN_PENDING_PACKET_QUEUE_MAX_AGE_MS)
+            break;
+
+        peer->pending_packet_queue_head = entry->next;
+        if(!peer->pending_packet_queue_head)
+            peer->pending_packet_queue_tail = NULL;
+
+        if(peer->pending_packet_queue_count > 0)
+            peer->pending_packet_queue_count--;
+        if(peer->pending_packet_queue_bytes >= entry->len)
+            peer->pending_packet_queue_bytes -= entry->len;
+        else
+            peer->pending_packet_queue_bytes = 0;
+
+        if(entry->len > N2N_SN_LEGACY_SAFE_UDP_SIZE) {
+            traceEvent(TRACE_INFO,
+                       "dropping queued oversized business packet of %u bytes for [%s] after KCP wait timed out",
+                       (unsigned int)entry->len,
+                       sock_to_cstr(sockbuf, &(peer->sock)));
+        } else {
+            ssize_t sent = sendto_peer(sss, peer, entry->data, entry->len, 0);
+
+            if(sent == entry->len) {
+                traceEvent(TRACE_INFO,
+                           "releasing queued business packet of %u bytes to [%s] over UDP after KCP wait timed out",
+                           (unsigned int)entry->len,
+                           sock_to_cstr(sockbuf, &(peer->sock)));
+            } else {
+                traceEvent(TRACE_WARNING,
+                           "failed to release queued business packet of %u bytes to [%s] after KCP wait timed out",
+                           (unsigned int)entry->len,
+                           sock_to_cstr(sockbuf, &(peer->sock)));
+            }
+        }
+
+        free(entry);
+    }
+}
+
+
+static void peer_clear_pending_packet_queue (struct peer_info *peer, const char *reason) {
+
+    if(!peer)
+        return;
+
+    while(peer->pending_packet_queue_head)
+        peer_drop_oldest_pending_packet(peer, reason);
+}
+
+
+static int peer_queue_pending_packet (n2n_sn_t *sss, struct peer_info *peer, const uint8_t *pktbuf, size_t pktsize) {
+
+    n2n_packet_queue_entry_t *entry;
+    uint32_t now_ms;
+
+    if(!sss || !peer || !pktbuf || !pktsize)
+        return 0;
+
+    if((pktsize > 0xFFFF) || (pktsize > N2N_SN_PENDING_PACKET_QUEUE_MAX_BYTES)) {
+        traceEvent(TRACE_WARNING,
+                   "dropping business packet of %u bytes: too large for supernode pending queue",
+                   (unsigned int)pktsize);
+        return 0;
+    }
+
+    now_ms = n2n_kcp_now_ms();
+    sn_handle_expired_pending_packets(sss, peer, now_ms);
+
+    while(peer->pending_packet_queue_head
+       && ((peer->pending_packet_queue_count >= N2N_SN_PENDING_PACKET_QUEUE_MAX_PACKETS)
+        || ((peer->pending_packet_queue_bytes + pktsize) > N2N_SN_PENDING_PACKET_QUEUE_MAX_BYTES))) {
+        peer_drop_oldest_pending_packet(peer, "queue limit reached");
+    }
+
+    if((peer->pending_packet_queue_count >= N2N_SN_PENDING_PACKET_QUEUE_MAX_PACKETS)
+    || ((peer->pending_packet_queue_bytes + pktsize) > N2N_SN_PENDING_PACKET_QUEUE_MAX_BYTES)) {
+        traceEvent(TRACE_WARNING,
+                   "dropping business packet of %u bytes: supernode pending queue is full",
+                   (unsigned int)pktsize);
+        return 0;
+    }
+
+    entry = calloc(1, sizeof(*entry) + pktsize);
+    if(!entry) {
+        traceEvent(TRACE_WARNING,
+                   "dropping business packet of %u bytes: cannot allocate supernode pending queue entry",
+                   (unsigned int)pktsize);
+        return 0;
+    }
+
+    entry->enqueue_ms = now_ms;
+    entry->len = (uint16_t)pktsize;
+    memcpy(entry->data, pktbuf, pktsize);
+
+    if(peer->pending_packet_queue_tail)
+        peer->pending_packet_queue_tail->next = entry;
+    else
+        peer->pending_packet_queue_head = entry;
+
+    peer->pending_packet_queue_tail = entry;
+    peer->pending_packet_queue_count++;
+    peer->pending_packet_queue_bytes += pktsize;
+
+    return 1;
+}
+
+
+static void free_peer_info (struct peer_info *peer) {
+
+    if(!peer)
+        return;
+
+    peer_clear_pending_packet_queue(peer, "peer removed");
+    free(peer);
 }
 
 static int update_edge (n2n_sn_t *sss,
@@ -158,7 +347,7 @@ void close_tcp_connection (n2n_sn_t *sss, n2n_tcp_connection_t *conn) {
             if(edge->socket_fd == conn->socket_fd) {
                 // remove peer
                 HASH_DEL(comm->edges, edge);
-                free(edge);
+                free_peer_info(edge);
                 goto close_conn; /* break - level 2 */
             }
         }
@@ -266,7 +455,7 @@ void send_re_register_super (n2n_sn_t *sss) {
                                       comm->header_encryption_ctx_dynamic, comm->header_iv_ctx_dynamic,
                                       time_stamp());
 
-                /* sent = */ sendto_peer(sss, edge, rereg_buf, encx);
+                /* sent = */ sendto_peer(sss, edge, rereg_buf, encx, 0);
              }
         }
     }
@@ -335,7 +524,7 @@ int load_allowed_sn_community (n2n_sn_t *sss) {
                 close_tcp_connection(sss, conn); /* also deletes the edge */
             } else {
                 HASH_DEL(comm->edges, edge);
-                free(edge);
+                free_peer_info(edge);
             }
         }
 
@@ -546,10 +735,15 @@ static ssize_t sendto_fd (n2n_sn_t *sss,
     if(socket_fd == sss->sock) {
         n2n_sock_t remote;
         n2n_kcp_ctx_t *kcp_ctx = NULL;
+        n2n_sock_str_t sockbuf;
 
         fill_n2nsock(&remote, socket);
         HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), kcp_ctx);
         if(kcp_ctx && kcp_ctx->active) {
+            traceEvent(TRACE_DEBUG,
+                       "routing %u-byte payload to edge [%s] via existing KCP session",
+                       (unsigned int)pktsize,
+                       sock_to_cstr(sockbuf, &remote));
             int kcp_sent = n2n_kcp_sn_send(sss, socket_fd, socket, pktbuf, pktsize);
             if(kcp_sent >= 0) {
                 traceEvent(TRACE_DEBUG, "sendto sent=%d to ", kcp_sent);
@@ -624,13 +818,47 @@ static ssize_t sendto_sock(n2n_sn_t *sss,
  *    @return -1 on error otherwise number of bytes sent
  */
 static ssize_t sendto_peer (n2n_sn_t *sss,
-                            const struct peer_info *peer,
+                            struct peer_info *peer,
                             const uint8_t *pktbuf,
-                            size_t pktsize) {
+                            size_t pktsize,
+                            uint8_t queue_oversized_business_packet) {
 
     n2n_sock_str_t sockbuf;
 
     if(AF_INET == peer->sock.family) {
+        if(queue_oversized_business_packet
+        && (peer->socket_fd == sss->sock)
+        && !peer_has_active_kcp(sss, peer)
+        && (peer->pending_packet_queue_head
+         || ((!peer->kcp_wait_attempted) && (pktsize > N2N_SN_LEGACY_SAFE_UDP_SIZE)))) {
+            if(!peer->pending_packet_queue_head && (pktsize > N2N_SN_LEGACY_SAFE_UDP_SIZE))
+                peer->kcp_wait_attempted = 1;
+
+            if(peer_queue_pending_packet(sss, peer, pktbuf, pktsize)) {
+                traceEvent(TRACE_INFO,
+                           "queueing business packet of %u bytes for [%s] while waiting for KCP to become available",
+                           (unsigned int)pktsize,
+                           sock_to_cstr(sockbuf, &(peer->sock)));
+            } else {
+                traceEvent(TRACE_WARNING,
+                           "dropping business packet of %u bytes for [%s]: pending queue unavailable while waiting for KCP",
+                           (unsigned int)pktsize,
+                           sock_to_cstr(sockbuf, &(peer->sock)));
+            }
+            return (ssize_t)pktsize;
+        }
+
+        if(queue_oversized_business_packet
+        && (peer->socket_fd == sss->sock)
+        && !peer_has_active_kcp(sss, peer)
+        && peer->kcp_wait_attempted
+        && (pktsize > N2N_SN_LEGACY_SAFE_UDP_SIZE)) {
+            traceEvent(TRACE_INFO,
+                       "dropping oversized business packet of %u bytes for [%s]: KCP wait window already exhausted",
+                       (unsigned int)pktsize,
+                       sock_to_cstr(sockbuf, &(peer->sock)));
+            return (ssize_t)pktsize;
+        }
 
         // network order socket
         struct sockaddr_in socket;
@@ -647,6 +875,93 @@ static ssize_t sendto_peer (n2n_sn_t *sss,
         /* AF_INET6 not implemented */
         errno = EAFNOSUPPORT;
         return -1;
+    }
+}
+
+
+static void sn_flush_peer_pending_packet_queue (n2n_sn_t *sss, struct peer_info *peer) {
+
+    n2n_sock_str_t sockbuf;
+
+    if(!sss || !peer || !peer->pending_packet_queue_head)
+        return;
+
+    if(!peer_has_active_kcp(sss, peer))
+        return;
+
+    traceEvent(TRACE_INFO,
+               "flushing %u queued business packets (%u bytes) to [%s] after KCP became available",
+               (unsigned int)peer->pending_packet_queue_count,
+               (unsigned int)peer->pending_packet_queue_bytes,
+               sock_to_cstr(sockbuf, &(peer->sock)));
+
+    while(peer->pending_packet_queue_head && peer_has_active_kcp(sss, peer)) {
+        n2n_packet_queue_entry_t *entry = peer->pending_packet_queue_head;
+        ssize_t sent = sendto_peer(sss, peer, entry->data, entry->len, 0);
+
+        if(sent != entry->len) {
+            traceEvent(TRACE_WARNING,
+                       "failed to flush queued business packet of %u bytes to [%s], keeping it queued",
+                       (unsigned int)entry->len,
+                       sock_to_cstr(sockbuf, &(peer->sock)));
+            break;
+        }
+
+        peer->pending_packet_queue_head = entry->next;
+        if(!peer->pending_packet_queue_head)
+            peer->pending_packet_queue_tail = NULL;
+
+        if(peer->pending_packet_queue_count > 0)
+            peer->pending_packet_queue_count--;
+        if(peer->pending_packet_queue_bytes >= entry->len)
+            peer->pending_packet_queue_bytes -= entry->len;
+        else
+            peer->pending_packet_queue_bytes = 0;
+
+        free(entry);
+    }
+}
+
+
+static void sn_flush_pending_packet_queue_by_sock (n2n_sn_t *sss, const struct sockaddr *sender_sock) {
+
+    struct sn_community *comm, *tmp_comm;
+    struct peer_info *peer, *tmp_peer;
+    n2n_sock_t sender;
+
+    if(!sss || !sender_sock)
+        return;
+
+    fill_n2nsock(&sender, sender_sock);
+
+    HASH_ITER(hh, sss->communities, comm, tmp_comm) {
+        HASH_ITER(hh, comm->edges, peer, tmp_peer) {
+            if(sock_equal(&peer->sock, &sender))
+                sn_flush_peer_pending_packet_queue(sss, peer);
+        }
+    }
+}
+
+
+static void sn_purge_all_pending_packet_queues (n2n_sn_t *sss) {
+
+    struct sn_community *comm, *tmp_comm;
+    struct peer_info *peer, *tmp_peer;
+    uint32_t now_ms;
+
+    if(!sss)
+        return;
+
+    now_ms = n2n_kcp_now_ms();
+
+    HASH_ITER(hh, sss->communities, comm, tmp_comm) {
+        HASH_ITER(hh, comm->edges, peer, tmp_peer) {
+            if(peer_has_active_kcp(sss, peer)) {
+                sn_flush_peer_pending_packet_queue(sss, peer);
+            } else {
+                sn_handle_expired_pending_packets(sss, peer, now_ms);
+            }
+        }
     }
 }
 
@@ -683,7 +998,7 @@ static int try_broadcast (n2n_sn_t * sss,
             // only forward to active supernodes
             if(scan->last_seen + LAST_SEEN_SN_INACTIVE > now) {
 
-                data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize);
+                data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize, 0);
 
                 if(data_sent_len != pktsize) {
                     ++(sss->stats.errors);
@@ -709,7 +1024,7 @@ static int try_broadcast (n2n_sn_t * sss,
                 /* REVISIT: exclude if the destination socket is where the packet came from. */
                 int data_sent_len;
 
-                data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize);
+                data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize, (cmn->pc == n2n_packet));
 
                 if(data_sent_len != pktsize) {
                     ++(sss->stats.errors);
@@ -751,7 +1066,7 @@ static int try_forward (n2n_sn_t * sss,
 
     if(NULL != scan) {
         int data_sent_len;
-        data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize);
+        data_sent_len = sendto_peer(sss, scan, pktbuf, pktsize, (cmn->pc == n2n_packet));
 
         if(data_sent_len == pktsize) {
             ++(sss->stats.fwd);
@@ -1183,7 +1498,7 @@ static int update_edge (n2n_sn_t *sss,
 
                 HASH_ADD_PEER(comm->edges, scan);
 
-                traceEvent(TRACE_INFO, "created edge  %s ==> %s",
+                traceEvent(TRACE_DEBUG, "created edge  %s ==> %s",
                            macaddr_str(mac_buf, reg->edgeMac),
                            sock_to_cstr(sockbuf, sender_sock));
             }
@@ -1208,7 +1523,7 @@ static int update_edge (n2n_sn_t *sss,
                 else
                     scan->preferred_sock.family = AF_INVALID;
 
-                traceEvent(TRACE_INFO, "updated edge  %s ==> %s",
+                traceEvent(TRACE_DEBUG, "updated edge  %s ==> %s",
                            macaddr_str(mac_buf, reg->edgeMac),
                            sock_to_cstr(sockbuf, sender_sock));
                 ret = update_edge_sock_change;
@@ -1494,7 +1809,7 @@ static int re_register_and_purge_supernodes (n2n_sn_t *sss, struct sn_community 
                                   comm->header_encryption_ctx_static, comm->header_iv_ctx_static,
                                   time_stamp());
 
-            /* sent = */ sendto_peer(sss, peer, pktbuf, idx);
+            /* sent = */ sendto_peer(sss, peer, pktbuf, idx, 0);
         }
     }
 
@@ -2211,7 +2526,7 @@ static int process_udp (n2n_sn_t * sss,
                             close_tcp_connection(sss, conn); /* also deletes the peer */
                         } else {
                             HASH_DEL(comm->edges, peer);
-                            free(peer);
+                            free_peer_info(peer);
                         }
                     }
                 }
@@ -2259,7 +2574,7 @@ static int process_udp (n2n_sn_t * sss,
                         close_tcp_connection(sss, conn); /* also deletes the peer */
                     } else {
                         HASH_DEL(comm->edges, peer);
-                        free(peer);
+                        free_peer_info(peer);
                     }
                 }
             }
@@ -2299,7 +2614,7 @@ static int process_udp (n2n_sn_t * sss,
                 }
             }
 
-            traceEvent(TRACE_INFO, "Rx REGISTER_SUPER_ACK from MAC %s [%s] (external %s)",
+            traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER_ACK from MAC %s [%s] (external %s)",
                        macaddr_str(mac_buf1, ack.srcMac),
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender));
@@ -2404,7 +2719,7 @@ static int process_udp (n2n_sn_t * sss,
                         }
                     }
 
-                    sendto_peer(sss, peer, nakbuf, encx);
+                    sendto_peer(sss, peer, nakbuf, encx, 0);
 
                     if((peer->socket_fd != sss->sock) && (peer->socket_fd >= 0)) {
                         n2n_tcp_connection_t *conn;
@@ -2412,7 +2727,7 @@ static int process_udp (n2n_sn_t * sss,
                         close_tcp_connection(sss, conn); /* also deletes the peer */
                     } else {
                         HASH_DEL(comm->edges, peer);
-                        free(peer);
+                        free_peer_info(peer);
                     }
                 }
             }
@@ -2590,7 +2905,7 @@ static int process_udp (n2n_sn_t * sss,
                 }
             }
 
-            traceEvent(TRACE_INFO, "Rx PEER_INFO from %s [%s]",
+            traceEvent(TRACE_DEBUG, "Rx PEER_INFO from %s [%s]",
                        macaddr_str(mac_buf, pi.srcMac),
                        sock_to_cstr(sockbuf, &sender));
 
@@ -2614,7 +2929,7 @@ static int process_udp (n2n_sn_t * sss,
                                               time_stamp());
                     }
 
-                    sendto_peer(sss, peer, encbuf, encx);
+                    sendto_peer(sss, peer, encbuf, encx, 0);
                 }
             }
             break;
@@ -2691,6 +3006,7 @@ int run_sn_loop (n2n_sn_t *sss) {
         now = time(NULL);
 
         n2n_kcp_sn_update(sss);
+        sn_purge_all_pending_packet_queues(sss);
 
         if(rc > 0) {
 
@@ -2729,6 +3045,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                             if(!n2n_kcp_sn_recv_pending(sss, sender_sock, ss_size, kcp_out, sizeof(kcp_out), &kcp_out_len))
                                 break;
                         }
+                        sn_flush_pending_packet_queue_by_sock(sss, sender_sock);
                     } else {
                         process_udp(sss, sender_sock, ss_size, sss->sock, pktbuf, bread, now);
                     }
@@ -2758,7 +3075,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                                      sender_sock, &ss_size);
 
                     if(bread <= 0) {
-                        traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
+                        traceEvent(TRACE_DEBUG, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                         traceEvent(TRACE_DEBUG, "recvfrom() returns %d and sees errno %d (%s)", bread, errno, strerror(errno));
 #ifdef _WIN32
                         traceEvent(TRACE_DEBUG, "WSAGetLastError(): %u", WSAGetLastError());
@@ -2773,7 +3090,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                             // the prepended length has been read, preparing for the packet
                             conn->expected += be16toh(*(uint16_t*)(conn->buffer));
                             if(conn->expected > N2N_SN_PKTBUF_SIZE) {
-                                traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
+                                traceEvent(TRACE_DEBUG, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                                 traceEvent(TRACE_DEBUG, "too many bytes in tcp packet expected");
                                 close_tcp_connection(sss, conn);
                                 continue;
@@ -2819,7 +3136,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                             conn->expected = sizeof(uint16_t);
                             conn->position = 0;
                             HASH_ADD_INT(sss->tcp_connections, socket_fd, conn);
-                            traceEvent(TRACE_INFO, "accepted incoming TCP connection from [%s]",
+                            traceEvent(TRACE_DEBUG, "accepted incoming TCP connection from [%s]",
                                                    sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                         }
                     }

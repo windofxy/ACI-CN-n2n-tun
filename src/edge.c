@@ -43,6 +43,7 @@
 #include "uthash.h"                  // for UT_hash_handle, HASH_ADD, HASH_C...
 
 #ifdef _WIN32
+#include <timeapi.h>
 #include "win32/defs.h"
 #include "win32/wintap.h"
 #else
@@ -302,10 +303,10 @@ static void help (int level) {
                "                   | useful if multicast peer detection is not available,\n"
                "                   | '-e auto' tries IP address auto-detection\n");
         printf(" -S1 ... -S3       | do not connect p2p, always use the supernode,\n"
-               "                   | -S1 = via UDP"
+               "                   | -S1 = via UDP/KCP"
 
 #ifdef N2N_HAVE_TCP
-                                  ", -S2 = via TCP, -S3 = hybrid UDP/KCP with TCP fallback"
+                                  ", -S2 = via TCP, -S3 = via UDP/KCP with TCP fallback"
 #endif
 "\n");
         printf(" -i <reg_interval> | registration interval, for NAT hole punching (default\n"
@@ -731,10 +732,13 @@ static int setOption (int optkey, char *optargument, n2n_tuntap_priv_config_t *e
             if(solitude >= 1)
                 conf->allow_p2p = 0;
 #ifdef N2N_HAVE_TCP
-            if(solitude == 2)
+            if(solitude == 2) {
                 conf->connect_tcp = 1;
-            else if(solitude == 3)
+                conf->prefer_kcp = 0;
+            } else if(solitude == 3) {
                 conf->connect_tcp = 0;
+                conf->prefer_kcp = 1;
+            }
 #endif
             break;
         }
@@ -1034,6 +1038,7 @@ int main (int argc, char* argv[]) {
     cap_t caps;
 #endif
 #ifdef _WIN32
+    int timer_period_enabled = 0;
     initWin32();
 #endif
 
@@ -1370,6 +1375,17 @@ int main (int argc, char* argv[]) {
 #endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(term_handler, TRUE);
+
+    {
+        MMRESULT timer_result = timeBeginPeriod(1);
+
+        if(timer_result == TIMERR_NOERROR) {
+            timer_period_enabled = 1;
+            traceEvent(TRACE_INFO, "enabled 1ms Windows timer period for lower-latency KCP scheduling");
+        } else {
+            traceEvent(TRACE_WARNING, "timeBeginPeriod(1) failed: %u", (unsigned int)timer_result);
+        }
+    }
 #endif
 
     eee->keep_running = &keep_on_running;
@@ -1394,6 +1410,9 @@ int main (int argc, char* argv[]) {
     edge_term(eee);
 
 #ifdef _WIN32
+    if(timer_period_enabled)
+        timeEndPeriod(1);
+
     destroyWin32();
 #endif
 

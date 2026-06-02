@@ -1,12 +1,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include "n2n.h"
 #include "n2n_wire.h"
 #include "portable_endian.h"
 #include "uthash.h"
 
-#define N2N_KCP_INTERVAL_MS 10
+#define N2N_KCP_INTERVAL_MS 5
 #define N2N_KCP_SNDBUF_WND 256
 #define N2N_KCP_RCVBUF_WND 256
 #define N2N_KCP_DEFAULT_MTU 1200
@@ -77,7 +78,13 @@ static int n2n_kcp_wait_timeout_ms_ctx (const n2n_kcp_ctx_t *ctx, uint32_t curre
 }
 
 uint32_t n2n_kcp_now_ms (void) {
-    return (uint32_t)(time_stamp() >> 12);
+    struct timeval tv;
+    uint64_t now_ms;
+
+    gettimeofday(&tv, NULL);
+    now_ms = ((uint64_t)tv.tv_sec * 1000u) + ((uint64_t)tv.tv_usec / 1000u);
+
+    return (uint32_t)(now_ms & 0xFFFFFFFFu);
 }
 
 uint32_t n2n_kcp_conv_for_sock (const n2n_sock_t *sock) {
@@ -120,9 +127,11 @@ static int n2n_kcp_sn_output (const char *buf, int len, ikcpcb *kcp, void *user)
 
 int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
     n2n_kcp_edge_output_ctx_t *user;
+    n2n_sock_str_t sockbuf;
     if(!eee || !remote || eee->udp_sock < 0) return 0;
     if(eee->sn_kcp.active && sock_equal(&eee->sn_kcp.remote_sock, remote)) return 0;
     n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
     user = (n2n_kcp_edge_output_ctx_t*)calloc(1, sizeof(*user));
     if(!user) return -1;
     user->eee = eee;
@@ -137,7 +146,10 @@ int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
     eee->sn_kcp.kcp->output = n2n_kcp_edge_output;
     n2n_kcp_configure(eee->sn_kcp.kcp);
     eee->sn_kcp.active = 1;
+    eee->sn_kcp.rx_confirm_count = 0;
     eee->sn_kcp.last_seen = time(NULL);
+    traceEvent(TRACE_DEBUG, "initialized KCP session to supernode [%s]",
+               sock_to_cstr(sockbuf, remote));
     return 0;
 }
 
@@ -153,6 +165,7 @@ int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2
 int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
     n2n_sock_t sender;
     uint32_t conv;
+    n2n_sock_str_t sockbuf;
 
     if(out_len) *out_len = 0;
     if(!eee || eee->udp_sock < 0 || !out_buf || !out_len) return 0;
@@ -160,8 +173,24 @@ int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, con
     if(!sock_equal(&sender, &eee->curr_sn->sock)) return 0;
     conv = n2n_kcp_conv_for_sock(&sender);
     if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
+    traceEvent(TRACE_DEBUG,
+               "received %u-byte KCP packet from supernode [%s]",
+               (unsigned int)len,
+               sock_to_cstr(sockbuf, &sender));
     if(n2n_kcp_edge_setup(eee, &sender) != 0) return 0;
     if(ikcp_input(eee->sn_kcp.kcp, (const char*)buf, (long)len) < 0) return 0;
+    if(!eee->sn_kcp_confirmed && eee->sn_kcp.rx_confirm_count < 0xFF)
+        eee->sn_kcp.rx_confirm_count++;
+    if(!eee->sn_kcp_confirmed && eee->sn_kcp.rx_confirm_count >= 2) {
+        eee->sn_kcp_confirmed = 1;
+        traceEvent(TRACE_INFO, "KCP session to supernode [%s] established",
+                   sock_to_cstr(sockbuf, &sender));
+    } else if(!eee->sn_kcp_confirmed) {
+        traceEvent(TRACE_DEBUG,
+                   "KCP session to supernode [%s] received warmup packet %u/2",
+                   sock_to_cstr(sockbuf, &sender),
+                   (unsigned int)eee->sn_kcp.rx_confirm_count);
+    }
     eee->sn_kcp.last_seen = now;
     ikcp_update(eee->sn_kcp.kcp, n2n_kcp_now_ms());
     n2n_kcp_recv_pending_ctx(&eee->sn_kcp, out_buf, out_buf_size, out_len);
@@ -193,9 +222,13 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd
     n2n_kcp_ctx_t *ctx;
     n2n_sock_t remote;
     n2n_kcp_sn_output_ctx_t *user;
+    n2n_sock_str_t sockbuf;
     fill_n2nsock(&remote, sender_sock);
     HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), ctx);
-    if(ctx) return ctx;
+    if(ctx) {
+        traceEvent(TRACE_DEBUG, "reusing KCP session for edge [%s]", sock_to_cstr(sockbuf, &remote));
+        return ctx;
+    }
     ctx = (n2n_kcp_ctx_t*)calloc(1, sizeof(*ctx));
     if(!ctx) return NULL;
     memcpy(&ctx->remote_sock, &remote, sizeof(remote));
@@ -219,15 +252,23 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd
     ctx->active = 1;
     ctx->last_seen = time(NULL);
     HASH_ADD(hh, sss->udp_kcp_connections, remote_sock, sizeof(n2n_sock_t), ctx);
+    traceEvent(TRACE_DEBUG, "created KCP session for edge [%s]", sock_to_cstr(sockbuf, &remote));
     return ctx;
 }
 
 int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *socket, const uint8_t *pktbuf, size_t pktsize) {
     n2n_kcp_ctx_t *ctx;
     socklen_t sock_len = sizeof(struct sockaddr_in);
+    n2n_sock_t remote;
+    n2n_sock_str_t sockbuf;
     if(!sss || !socket || socket_fd != sss->sock) return -1;
+    fill_n2nsock(&remote, socket);
     ctx = n2n_kcp_sn_find_or_create(sss, socket_fd, socket, sock_len);
     if(!ctx) return -1;
+    traceEvent(TRACE_DEBUG,
+               "sending %u-byte payload to edge [%s] over KCP",
+               (unsigned int)pktsize,
+               sock_to_cstr(sockbuf, &remote));
     if(ikcp_send(ctx->kcp, (const char*)pktbuf, (int)pktsize) < 0) return -1;
     ikcp_update(ctx->kcp, n2n_kcp_now_ms());
     return (int)pktsize;
@@ -236,6 +277,7 @@ int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *soc
 int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len) {
     n2n_kcp_ctx_t *ctx;
     n2n_sock_t remote;
+    n2n_sock_str_t sockbuf;
     uint32_t conv;
     int rc;
     if(out_len) *out_len = 0;
@@ -243,6 +285,10 @@ int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock,
     fill_n2nsock(&remote, sender_sock);
     conv = n2n_kcp_conv_for_sock(&remote);
     if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
+    traceEvent(TRACE_DEBUG,
+               "received %u-byte KCP packet from edge [%s]",
+               (unsigned int)len,
+               sock_to_cstr(sockbuf, &remote));
     ctx = n2n_kcp_sn_find_or_create(sss, sss->sock, sender_sock, sender_len);
     if(!ctx) return 0;
     rc = ikcp_input(ctx->kcp, (const char*)buf, (long)len);

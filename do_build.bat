@@ -33,7 +33,7 @@ set "BUILD_DATE=%DATE% %TIME%"
 set "CFLAGS=-DGNUC=1 -DWINVER=0x0600 -D_CONSOLE -D_CRT_SECURE_NO_WARNINGS -D_WIN32_WINNT=0x0600"
 set "INCLUDES=-I"%SRC%\include" -I"%SRC%\src" -I"%SRC%\thirdparty" -I"%SRC%\build""
 set "FLAGS=-Wall -O3 -std=gnu99"
-set "LDLIBS=-lws2_32 -liphlpapi -lsetupapi -lnewdev -lcfgmgr32 -lole32 -lm"
+set "LDLIBS=-lws2_32 -liphlpapi -lwinmm -lsetupapi -lnewdev -lcfgmgr32 -lole32 -lm"
 
 set "HAVE_OPENSSL=0"
 set "HAVE_ZSTD=0"

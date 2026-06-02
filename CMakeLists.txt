@@ -143,7 +143,7 @@ if(WIN32)
     add_definitions(-DGNUC=1)
 
     # Windows requires ws2_32 for networking
-    set(PLATFORM_LIBS ws2_32 iphlpapi advapi32 kernel32 user32)
+    set(PLATFORM_LIBS ws2_32 iphlpapi winmm advapi32 kernel32 user32)
 
     # MinGW-specific settings
     if(MINGW)

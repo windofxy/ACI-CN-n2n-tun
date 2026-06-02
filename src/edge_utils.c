@@ -41,13 +41,16 @@
 #include "uthash.h"                  // for UT_hash_handle, HASH_COUNT, HASH...
 
 #define N2N_TCP_FALLBACK_KCP_PROBE_INTERVAL 5
-#define N2N_REGISTER_RETRY_INITIAL_MS 200
-#define N2N_REGISTER_RETRY_MAX_MS 1000
 #define N2N_TCP_REGISTER_SOFT_RETRIES 2
+#define N2N_KCP_PRIME_BURST_SENDS 1
 #define N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS 2
 #define N2N_PENDING_PACKET_QUEUE_MAX_PACKETS 256
 #define N2N_PENDING_PACKET_QUEUE_MAX_BYTES (2 * 1024 * 1024)
 #define N2N_PENDING_PACKET_QUEUE_MAX_AGE_MS 3000
+#define N2N_RX_SUPERNODE_TRANSPORT_NONE 0
+#define N2N_RX_SUPERNODE_TRANSPORT_UDP  1
+#define N2N_RX_SUPERNODE_TRANSPORT_TCP  2
+#define N2N_RX_SUPERNODE_TRANSPORT_KCP  3
 
 #ifdef _WIN32
 #include "win32/defs.h"
@@ -321,12 +324,32 @@ static void edge_reset_register_super_request (n2n_edge_t *eee) {
 }
 
 
+static const char *edge_supernode_rx_transport_str (uint8_t transport) {
+
+    switch(transport) {
+        case N2N_RX_SUPERNODE_TRANSPORT_UDP: return "UDP";
+        case N2N_RX_SUPERNODE_TRANSPORT_TCP: return "TCP";
+        case N2N_RX_SUPERNODE_TRANSPORT_KCP: return "KCP";
+        default: return "UNKNOWN";
+    }
+}
+
+
 static int edge_recent_supernode_udp_activity (const n2n_edge_t *eee, time_t now) {
 
-    if(!eee || !eee->last_sup)
+    if(!eee || !eee->last_udp_sup)
         return 0;
 
-    return ((now - eee->last_sup) <= N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS);
+    return ((now - eee->last_udp_sup) <= N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS);
+}
+
+
+static int edge_recent_supernode_kcp_activity (const n2n_edge_t *eee, time_t now) {
+
+    if(!eee || !eee->sn_kcp.active || !eee->sn_kcp_confirmed || !eee->sn_kcp.last_seen)
+        return 0;
+
+    return ((now - eee->sn_kcp.last_seen) <= N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS);
 }
 
 
@@ -567,6 +590,7 @@ static void supernode_disconnect_udp (n2n_edge_t *eee) {
     }
 
     n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
 }
 
 
@@ -605,6 +629,7 @@ static void edge_release_tcp_sticky_after_disconnect (n2n_edge_t *eee, const cha
     eee->register_super_soft_retry_armed = 0;
     edge_reset_register_super_request(eee);
     n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
     edge_set_active_transport(eee, N2N_SN_TRANSPORT_UDP);
     reset_sup_attempts(eee);
 }
@@ -642,25 +667,20 @@ static void edge_mark_udp_recovered (n2n_edge_t *eee, const char *reason) {
 
 static int edge_register_retry_interval_ms (const n2n_edge_t *eee) {
 
+    static const int retry_schedule_ms[] = { 300, 600, 1000, 1500 };
     uint8_t stage;
-    int interval_ms;
+    size_t max_stage;
 
     if(!eee)
-        return N2N_REGISTER_RETRY_INITIAL_MS;
+        return retry_schedule_ms[0];
 
     stage = eee->register_fast_retry_count;
-    interval_ms = N2N_REGISTER_RETRY_INITIAL_MS;
+    max_stage = (sizeof(retry_schedule_ms) / sizeof(retry_schedule_ms[0])) - 1;
 
-    while(stage-- > 0) {
-        if(interval_ms >= N2N_REGISTER_RETRY_MAX_MS)
-            return N2N_REGISTER_RETRY_MAX_MS;
+    if(stage > max_stage)
+        stage = (uint8_t)max_stage;
 
-        interval_ms <<= 1;
-        if(interval_ms > N2N_REGISTER_RETRY_MAX_MS)
-            interval_ms = N2N_REGISTER_RETRY_MAX_MS;
-    }
-
-    return interval_ms;
+    return retry_schedule_ms[stage];
 }
 
 
@@ -708,6 +728,7 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
     /* Drop the dead KCP session first so a failed TCP connect does not
      * trigger a new fallback attempt every select cycle. */
     n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
 
     if(edge_switch_to_tcp_supernode(eee, "KCP session reached dead_link threshold")) {
         /* Reuse the existing immediate re-register path so TCP fallback can
@@ -851,8 +872,10 @@ int supernode_connect (n2n_edge_t *eee) {
     if(!eee)
         return -1;
 
-    if(eee->sn_kcp.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp.remote_sock))
+    if(eee->sn_kcp.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp.remote_sock)) {
         n2n_kcp_ctx_term(&eee->sn_kcp);
+        eee->sn_kcp_confirmed = 0;
+    }
 
     if(eee->tcp_sn_sock_valid && !edge_dest_is_current_supernode(eee, &eee->tcp_sn_sock))
         supernode_disconnect_tcp(eee);
@@ -1062,6 +1085,7 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     eee->kcp_probe_pending = 0;
     eee->kcp_probe_cookie = 0;
     eee->last_kcp_probe = 0;
+    eee->sn_kcp_confirmed = 0;
     eee->last_register_req_ms = 0;
     eee->register_fast_retry_count = 0;
     eee->tcp_register_soft_retry_budget = 0;
@@ -1069,6 +1093,7 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     eee->register_super_soft_retry_armed = 0;
     eee->register_super_request_active = 0;
     eee->sending_supernode_control = 0;
+    eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
     eee->register_super_cookie = 0;
     memset(&eee->register_super_auth, 0, sizeof(eee->register_super_auth));
     eee->pending_packet_queue_head = NULL;
@@ -1627,16 +1652,55 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
                           const n2n_sock_t * n2ndest) {
 
     ssize_t sent = 0;
+    int sock_errno = 0;
+#ifdef _WIN32
+    int wsa_error = 0;
+#endif
+    char * errstr = NULL;
+    n2n_sock_str_t sockbuf;
+    int send_failed = 0;
+    int should_prime_kcp = 0;
 
     if(check_sock_ready(eee) < 1) {
+        sock_errno = errno;
+#ifdef _WIN32
+        wsa_error = WSAGetLastError();
+#endif
+        errstr = strerror(sock_errno);
         goto err_out;
     }
 
-    if((!edge_transport_uses_tcp(eee)) && eee->sn_kcp.active && n2ndest && sock_equal(n2ndest, &(eee->curr_sn->sock))) {
-        int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
-        if(kcp_sent >= 0) {
-            traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
-            return kcp_sent;
+    if((!edge_transport_uses_tcp(eee)) && n2ndest && sock_equal(n2ndest, &(eee->curr_sn->sock))) {
+        if(eee->sn_kcp.active && eee->sn_kcp_confirmed) {
+            int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
+            if(kcp_sent >= 0) {
+                traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
+                return kcp_sent;
+            }
+        }
+
+        should_prime_kcp = (eee->conf.prefer_kcp
+                         && eee->sending_supernode_control
+                         && !eee->sn_kcp_confirmed);
+
+        if(should_prime_kcp) {
+            int prime_attempt;
+            int prime_successes = 0;
+
+            for(prime_attempt = 0; prime_attempt < N2N_KCP_PRIME_BURST_SENDS; ++prime_attempt) {
+                int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
+                if(kcp_sent < 0)
+                    break;
+
+                prime_successes++;
+            }
+
+            if(prime_successes > 0) {
+                traceEvent(TRACE_DEBUG,
+                           "primed KCP for supernode [%s] with %d mirrored UDP-compatible control sends",
+                           sock_to_cstr(sockbuf, n2ndest),
+                           prime_successes);
+            }
         }
     }
 
@@ -1651,12 +1715,12 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
 
     // We only get here if sendto failed. On Windows, Winsock keeps the
     // authoritative error code in WSAGetLastError() rather than errno.
-    int sock_errno = errno;
+    sock_errno = errno;
 #ifdef _WIN32
-    int wsa_error = WSAGetLastError();
+    wsa_error = WSAGetLastError();
 #endif
-    char * errstr = strerror(sock_errno);
-    n2n_sock_str_t sockbuf;
+    errstr = strerror(sock_errno);
+    send_failed = 1;
 
     if(!errstr) {
         traceEvent(TRACE_WARNING, "bad strerror");
@@ -1691,14 +1755,27 @@ err_out:
         && !eee->register_super_soft_retry_armed
         && eee->tcp_register_soft_retry_budget > 0) {
             unsigned int retries_left;
+            const char *transport = (eee->active_sn_transport == N2N_SN_TRANSPORT_TCP) ? "TCP"
+                                  : ((eee->active_sn_transport == N2N_SN_TRANSPORT_UDP) ? "UDP" : "UNKNOWN");
 
             eee->register_super_soft_retry_armed = 1;
             eee->tcp_register_soft_retry_budget--;
             retries_left = (unsigned int)eee->tcp_register_soft_retry_budget;
 
             traceEvent(TRACE_WARNING,
-                       "TCP REGISTER_SUPER send failed during fallback, scheduling soft retry (%u retries left)",
-                       retries_left);
+                       "TCP REGISTER_SUPER send failed during fallback to supernode [%s], scheduling soft retry (%u retries left, transport=%s)",
+                       supernode_ip(eee),
+                       retries_left,
+                       transport);
+#ifdef _WIN32
+            traceEvent(TRACE_WARNING,
+                       "TCP REGISTER_SUPER fallback send detail: send_failed=%d errno=%d (%s) wsa=%u",
+                       send_failed, sock_errno, errstr ? errstr : "unknown", wsa_error);
+#else
+            traceEvent(TRACE_WARNING,
+                       "TCP REGISTER_SUPER fallback send detail: send_failed=%d errno=%d (%s)",
+                       send_failed, sock_errno, errstr ? errstr : "unknown");
+#endif
 
             supernode_disconnect_tcp(eee);
 
@@ -2110,7 +2187,7 @@ static void send_register (n2n_edge_t * eee,
     idx = 0;
     encode_REGISTER(pktbuf, &idx, &cmn, &reg);
 
-    traceEvent(TRACE_INFO, "send REGISTER to [%s]",
+    traceEvent(TRACE_DEBUG, "send REGISTER to [%s]",
                sock_to_cstr(sockbuf, remote_peer));
 
     if(eee->conf.header_encryption == HEADER_ENCRYPTION_ENABLED)
@@ -2158,7 +2235,7 @@ static void send_register_ack (n2n_edge_t * eee,
     idx = 0;
     encode_REGISTER_ACK(pktbuf, &idx, &cmn, &ack);
 
-    traceEvent(TRACE_INFO, "send REGISTER_ACK to [%s]",
+    traceEvent(TRACE_DEBUG, "send REGISTER_ACK to [%s]",
                sock_to_cstr(sockbuf, remote_peer));
 
     if(eee->conf.header_encryption == HEADER_ENCRYPTION_ENABLED)
@@ -2276,6 +2353,23 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
             traceEvent(TRACE_INFO,
                        "deferring TCP fallback for supernode [%s]: recent UDP traffic was still received",
                        supernode_ip(eee));
+            eee->sn_wait = 0;
+            eee->register_fast_retry_count = 0;
+            eee->tcp_register_soft_retry_budget = 0;
+            eee->register_super_soft_retry_armed = 0;
+            edge_reset_register_super_request(eee);
+            reset_sup_attempts(eee);
+        } else if(!edge_transport_is_forced_tcp(eee)
+               && !edge_transport_uses_tcp(eee)
+               && edge_recent_supernode_kcp_activity(eee, now)) {
+            traceEvent(TRACE_INFO,
+                       "deferring TCP fallback for supernode [%s]: recent confirmed KCP traffic was still received",
+                       supernode_ip(eee));
+            eee->sn_wait = 0;
+            eee->register_fast_retry_count = 0;
+            eee->tcp_register_soft_retry_budget = 0;
+            eee->register_super_soft_retry_armed = 0;
+            edge_reset_register_super_request(eee);
             reset_sup_attempts(eee);
         } else if(edge_switch_to_tcp_supernode(eee, "supernode did not answer over UDP/KCP")) {
             traceEvent(TRACE_NORMAL, "retrying current supernode [%s] over TCP", supernode_ip(eee));
@@ -2406,6 +2500,8 @@ static int handle_PACKET (n2n_edge_t * eee,
 
         ++(eee->stats.rx_sup);
         eee->last_sup = now;
+        if(eee->current_supernode_rx_transport == N2N_RX_SUPERNODE_TRANSPORT_UDP)
+            eee->last_udp_sup = now;
     } else {
         ++(eee->stats.rx_p2p);
         eee->last_p2p=now;
@@ -2468,7 +2564,7 @@ static int handle_PACKET (n2n_edge_t * eee,
             is_multicast = (is_ip6_discovery(eth_payload, eth_size) || is_ethMulticast(eth_payload, eth_size));
 
             if(eee->conf.drop_multicast && is_multicast) {
-                traceEvent(TRACE_INFO, "dropping RX multicast");
+                traceEvent(TRACE_DEBUG, "dropping RX multicast");
                 return(-1);
             } else if((!eee->conf.allow_routing) && (!is_multicast)) {
                 /* Check if it is a routed packet */
@@ -2484,7 +2580,7 @@ static int handle_PACKET (n2n_edge_t * eee,
                                    intoa(ntohl(*dst), ip_buf, sizeof(ip_buf)));
                     else if((*dst != eee->device.ip_addr)) {
                         /* This is a packet that needs to be routed */
-                        traceEvent(TRACE_INFO, "discarding routed packet destined to [%s]",
+                        traceEvent(TRACE_DEBUG, "discarding routed packet destined to [%s]",
                                    intoa(ntohl(*dst), ip_buf, sizeof(ip_buf)));
                         return(-1);
                     } else {
@@ -2701,7 +2797,7 @@ static int send_packet (n2n_edge_t * eee,
 
     is_p2p = find_peer_destination(eee, dstMac, &destination);
 
-    traceEvent(TRACE_INFO, "Tx PACKET of %u bytes to %s [%s]",
+    traceEvent(TRACE_DEBUG, "Tx PACKET of %u bytes to %s [%s]",
                pktlen, macaddr_str(mac_buf, dstMac),
                sock_to_cstr(sockbuf, &destination));
 
@@ -2757,7 +2853,7 @@ void edge_send_packet2net (n2n_edge_t * eee,
             /* Note: all elements of the_ip are in network order */
             if(*src != eee->device.ip_addr) {
                 /* This is a packet that needs to be routed */
-                traceEvent(TRACE_INFO, "discarding routed packet destined to [%s]",
+                traceEvent(TRACE_DEBUG, "discarding routed packet destined to [%s]",
                            intoa(ntohl(*src), ip_buf, sizeof(ip_buf)));
                 return;
             } else {
@@ -2920,7 +3016,7 @@ void edge_read_from_tap (n2n_edge_t * eee) {
         if(eee->conf.drop_multicast &&
            (is_ip6_discovery(eth_pkt, len) ||
             is_ethMulticast(eth_pkt, len))) {
-                traceEvent(TRACE_INFO, "dropping Tx multicast");
+                traceEvent(TRACE_DEBUG, "dropping Tx multicast");
         } else {
             if(!eee->last_sup) {
                 // drop packets before first registration with supernode
@@ -3154,7 +3250,7 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                      * a valid channel. We still use check_peer_registration_needed below
                      * to double check this.
                      */
-                    traceEvent(TRACE_INFO, "[p2p] Rx REGISTER from %s [%s]%s",
+                    traceEvent(TRACE_DEBUG, "[p2p] Rx REGISTER from %s [%s]%s",
                                            macaddr_str(mac_buf1, reg.srcMac),
                                            sock_to_cstr(sockbuf1, &sender),
                                            (reg.cookie & N2N_LOCAL_REG_COOKIE) ? " (local)" : "");
@@ -3189,7 +3285,7 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                 if(is_valid_peer_sock(&ra.sock))
                     orig_sender = &(ra.sock);
 
-                traceEvent(TRACE_INFO, "Rx REGISTER_ACK from %s [%s] to %s via [%s]%s",
+                traceEvent(TRACE_DEBUG, "Rx REGISTER_ACK from %s [%s] to %s via [%s]%s",
                            macaddr_str(mac_buf1, ra.srcMac),
                            sock_to_cstr(sockbuf2, orig_sender),
                            macaddr_str(mac_buf2, ra.dstMac),
@@ -3244,7 +3340,11 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                 }
 
                 if(ra.cookie != eee->curr_sn->last_cookie) {
-                    traceEvent(TRACE_INFO, "Rx REGISTER_SUPER_ACK with wrong or old cookie");
+                    traceEvent(TRACE_INFO,
+                               "Rx REGISTER_SUPER_ACK with wrong or old cookie via %s (ack_cookie=%u current_cookie=%u)",
+                               edge_supernode_rx_transport_str(eee->current_supernode_rx_transport),
+                               (unsigned int)ra.cookie,
+                               (unsigned int)eee->curr_sn->last_cookie);
                     return;
                 }
 
@@ -3259,10 +3359,11 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                 if(is_valid_peer_sock(&ra.sock))
                     orig_sender = &(ra.sock);
 
-                traceEvent(TRACE_INFO, "Rx REGISTER_SUPER_ACK from %s [%s] (external %s) with %u attempts left",
+                traceEvent(TRACE_INFO, "Rx REGISTER_SUPER_ACK from %s [%s] (external %s) via %s with %u attempts left",
                            macaddr_str(mac_buf1, ra.srcMac),
                            sock_to_cstr(sockbuf1, &sender),
                            sock_to_cstr(sockbuf2, orig_sender),
+                           edge_supernode_rx_transport_str(eee->current_supernode_rx_transport),
                            (unsigned int)eee->sup_attempts);
 
                 if(eee->tcp_fallback_active && (eee->udp_sock >= 0) && (in_sock == eee->udp_sock))
@@ -3338,6 +3439,8 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                         send_grat_arps(eee);
                     }
                     eee->last_sup = now;
+                    if(eee->current_supernode_rx_transport == N2N_RX_SUPERNODE_TRANSPORT_UDP)
+                        eee->last_udp_sup = now;
                 }
 
                 // NOTE: the register_interval should be chosen by the edge node based on its NAT configuration.
@@ -3431,6 +3534,8 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                     if(scan != NULL) {
                         eee->sn_pong = 1;
                         eee->last_sup = now;
+                        if(eee->current_supernode_rx_transport == N2N_RX_SUPERNODE_TRANSPORT_UDP)
+                            eee->last_udp_sup = now;
                         scan->last_seen = now;
                         scan->uptime = pi.uptime;
                         memcpy(scan->version, pi.version, sizeof(n2n_version_t));
@@ -3453,6 +3558,8 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
 
                     if(scan) {
                         eee->last_sup = now;
+                        if(eee->current_supernode_rx_transport == N2N_RX_SUPERNODE_TRANSPORT_UDP)
+                            eee->last_udp_sup = now;
                         scan->sock = pi.sock;
 
                         traceEvent(TRACE_INFO, "Rx PEER_INFO %s can be found at [%s]",
@@ -3560,12 +3667,16 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                     if(eee->tcp_fallback_active)
                         edge_mark_udp_recovered(eee, "received KCP packet from supernode");
                     while(kcp_out_len > 0) {
+                        eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_KCP;
                         process_udp(eee, sender_sock, sock, kcp_out, kcp_out_len, now);
+                        eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
                         if(!n2n_kcp_edge_recv_pending(eee, kcp_out, sizeof(kcp_out), &kcp_out_len))
                             break;
                     }
                 } else {
+                    eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_UDP;
                     process_udp(eee, sender_sock, sock, pktbuf, bread, now);
+                    eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
                 }
             } else {
                 process_udp(eee, sender_sock, sock, pktbuf, bread, now);
@@ -3603,8 +3714,10 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                 }
             } else {
                 // full packet read, handle it
+                eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_TCP;
                 process_udp(eee, sender_sock, sock,
                                  pktbuf + sizeof(uint16_t), *position - sizeof(uint16_t), now);
+                eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
                 // reset, await new prepended length
                 *expected = sizeof(uint16_t);
                 *position = 0;
@@ -3788,7 +3901,7 @@ int run_edge_loop (n2n_edge_t *eee) {
                                          PURGE_REGISTRATION_FREQUENCY, REGISTRATION_TIMEOUT);
 
         if(numPurged > 0) {
-            traceEvent(TRACE_INFO, "%u peers removed. now: pending=%u, operational=%u",
+            traceEvent(TRACE_DEBUG, "%u peers removed. now: pending=%u, operational=%u",
                        numPurged,
                        HASH_COUNT(eee->pending_peers),
                        HASH_COUNT(eee->known_peers));
@@ -3847,6 +3960,7 @@ void edge_term (n2n_edge_t * eee) {
     resolve_cancel_thread(eee->resolve_parameter);
 
     n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
 
     if(eee->sock >= 0)
         closesocket(eee->sock);
@@ -3952,6 +4066,7 @@ void edge_init_conf_defaults (n2n_edge_conf_t *conf) {
     conf->compression = N2N_COMPRESSION_ID_NONE;
     conf->drop_multicast = 1;
     conf->allow_p2p = 1;
+    conf->prefer_kcp = 1;
     conf->disable_pmtu_discovery = 1;
     conf->register_interval = REGISTER_SUPER_INTERVAL_DFL;
     conf->tuntap_ip_mode = TUNTAP_IP_MODE_SN_ASSIGN;

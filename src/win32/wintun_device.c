@@ -1779,7 +1779,7 @@ static int fragment_ipv4_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, siz
         payload_cursor += frag_payload_len;
     }
 
-    traceEvent(TRACE_WARNING,
+    traceEvent(TRACE_DEBUG,
                "wintun_read: oversized IPv4 packet ip_len=%u ihl=%u df=%u frag_offset=%u proto=%u src=%s dst=%s action=fragmented fragments=%u mtu=%u",
                (unsigned)total_len, (unsigned)ihl, (unsigned)((frag_field & 0x4000u) ? 1 : 0),
                (unsigned)(frag_offset_units * 8u), (unsigned)pkt[9], src_ip, dst_ip,
@@ -1911,7 +1911,7 @@ static int fragment_ipv6_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, siz
         data_offset += frag_data_len;
     }
 
-    traceEvent(TRACE_WARNING,
+    traceEvent(TRACE_DEBUG,
                "wintun_read: oversized IPv6 packet ip_len=%u next=%u src=%s dst=%s action=fragmented fragments=%u mtu=%u frag_insert=%u",
                (unsigned)ipv6_total_len, (unsigned)next_header, src_ip, dst_ip,
                (unsigned)fragments, ctx->mtu, (unsigned)frag_insert_offset);
@@ -1995,7 +1995,7 @@ int wintun_read(_In_ tuntap_dev* device, _Out_ unsigned char* buf, _In_ int len)
         }
         ctx->arp_reply_len = 0;  /* Clear after consuming */
         LeaveCriticalSection(&ctx->arp_cs);
-        traceEvent(TRACE_INFO, "wintun_read: returning cached ARP reply (%d bytes)", reply_len);
+        traceEvent(TRACE_DEBUG, "wintun_read: returning cached ARP reply (%d bytes)", reply_len);
         return reply_len;
     }
     LeaveCriticalSection(&ctx->arp_cs);
@@ -2128,7 +2128,7 @@ int wintun_write(_In_ tuntap_dev* device, _In_ unsigned char* buf, _In_ int len)
                 ctx->arp_reply_len = ARP_PKT_SIZE;
                 LeaveCriticalSection(&ctx->arp_cs);
 
-                traceEvent(TRACE_INFO, "wintun_write: generated ARP reply for %u.%u.%u.%u",
+                traceEvent(TRACE_DEBUG, "wintun_write: generated ARP reply for %u.%u.%u.%u",
                            (unsigned)(ntohl(target_ip) >> 24) & 0xFF,
                            (unsigned)(ntohl(target_ip) >> 16) & 0xFF,
                            (unsigned)(ntohl(target_ip) >> 8) & 0xFF,

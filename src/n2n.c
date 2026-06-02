@@ -330,7 +330,7 @@ int supernode2sock (n2n_sock_t *sn, const n2n_sn_name_t addrIn) {
                     saddr = (struct sockaddr_in *)ainfo->ai_addr;
                     memcpy(sn->addr.v4, &(saddr->sin_addr.s_addr), IPV4_SIZE);
                     sn->family = AF_INET;
-                    traceEvent(TRACE_INFO, "supernode2sock successfully resolves supernode IPv4 address for %s", supernode_host);
+                    traceEvent(TRACE_DEBUG, "supernode2sock successfully resolves supernode IPv4 address for %s", supernode_host);
                     rv = 0;
                 } else {
                     /* Should only return IPv4 addresses due to aihints. */
@@ -488,7 +488,7 @@ uint8_t resolve_check (n2n_resolve_parameter_t *param, uint8_t requires_resoluti
                 // sockets do not get overwritten in case of error in resolve_thread) from list to supernode list
                 HASH_ITER(hh, param->list, entry, tmp_entry) {
                     memcpy(entry->org_sock, &entry->sock, sizeof(n2n_sock_t));
-                    traceEvent(TRACE_INFO, "resolve_check renews ip address of supernode '%s' to %s",
+                    traceEvent(TRACE_DEBUG, "resolve_check renews ip address of supernode '%s' to %s",
                                            entry->org_ip, sock_to_cstr(sock_buf, &(entry->sock)));
                }
             }

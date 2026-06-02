@@ -446,6 +446,7 @@ typedef struct n2n_QUERY_PEER {
 } n2n_QUERY_PEER_t;
 
 typedef struct n2n_buf n2n_buf_t;
+typedef struct n2n_packet_queue_entry n2n_packet_queue_entry_t;
 
 struct peer_info {
     n2n_mac_t                        mac_addr;
@@ -467,6 +468,11 @@ struct peer_info {
     uint8_t                          local;
     time_t                           uptime;
     n2n_version_t                    version;
+    n2n_packet_queue_entry_t         *pending_packet_queue_head;         /**< queued oversized business packets while waiting for KCP on UDP */
+    n2n_packet_queue_entry_t         *pending_packet_queue_tail;         /**< tail pointer for queued oversized business packets */
+    size_t                           pending_packet_queue_count;         /**< number of queued oversized business packets */
+    size_t                           pending_packet_queue_bytes;         /**< total bytes in queued oversized business packets */
+    uint8_t                          kcp_wait_attempted;                /**< whether this peer already consumed its one-shot KCP wait window */
 
     UT_hash_handle     hh; /* makes this structure hashable */
 };
@@ -478,6 +484,7 @@ typedef struct n2n_kcp_ctx {
     n2n_sock_t                        remote_sock;
     uint32_t                          conv;
     uint8_t                           active;
+    uint8_t                           rx_confirm_count;
     time_t                            last_seen;
 
     UT_hash_handle                    hh;
@@ -498,7 +505,6 @@ struct host_info {
 #endif
 
 typedef struct n2n_edge n2n_edge_t;
-typedef struct n2n_packet_queue_entry n2n_packet_queue_entry_t;
 
 /* *************************************************** */
 
@@ -699,6 +705,7 @@ typedef struct n2n_edge_conf {
     int                      local_port;
     int                      mgmt_port;
     uint8_t                  connect_tcp;            /** connection to supernode 0 = UDP; 1 = TCP */
+    uint8_t                  prefer_kcp;            /** prefer KCP when communicating with the supernode over UDP */
     n2n_auth_t               auth;
     filter_rule_t            *network_traffic_filter_rules;
     int                      metric;                /**< Network interface metric (Windows only). */
@@ -751,6 +758,7 @@ struct n2n_edge {
     uint8_t                          kcp_probe_pending;                  /**< whether a KCP recovery probe is in flight */
     n2n_cookie_t                     kcp_probe_cookie;                   /**< cookie associated with the outstanding KCP probe */
     time_t                           last_kcp_probe;                     /**< last KCP recovery probe timestamp */
+    uint8_t                          sn_kcp_confirmed;                   /**< whether the current supernode has replied with a valid KCP packet */
     uint32_t                         last_register_req_ms;               /**< last REGISTER_SUPER send attempt time in ms */
     uint8_t                          register_fast_retry_count;          /**< current fast retry backoff stage for REGISTER_SUPER */
     uint8_t                          tcp_register_soft_retry_budget;     /**< remaining TCP soft retries for REGISTER_SUPER during fallback */
@@ -758,6 +766,7 @@ struct n2n_edge {
     uint8_t                          register_super_soft_retry_armed;    /**< whether current REGISTER_SUPER send already consumed one TCP soft retry */
     uint8_t                          register_super_request_active;      /**< whether current REGISTER_SUPER retry sequence reuses a fixed cookie/auth token */
     uint8_t                          sending_supernode_control;          /**< whether current send is an allowed TCP fallback control-plane send */
+    uint8_t                          current_supernode_rx_transport;     /**< current transport used by the supernode packet being processed */
     n2n_cookie_t                     register_super_cookie;              /**< cookie reused across one REGISTER_SUPER retry sequence */
     n2n_auth_t                       register_super_auth;                /**< auth token reused across one REGISTER_SUPER retry sequence */
     n2n_kcp_ctx_t                    sn_kcp;                             /**< KCP session for supernode UDP transport. */
@@ -782,6 +791,7 @@ struct n2n_edge {
     time_t                           last_register_req;                  /**< Check if time to re-register with super*/
     time_t                           last_p2p;                           /**< Last time p2p traffic was received. */
     time_t                           last_sup;                           /**< Last time a packet arrived from supernode. */
+    time_t                           last_udp_sup;                       /**< Last time a packet arrived from supernode over plain UDP. */
     time_t                           last_sweep;                         /**< Last time a sweep was performed. */
     time_t                           start_time;                         /**< For calculating uptime */
 
