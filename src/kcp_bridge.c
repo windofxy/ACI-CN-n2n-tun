@@ -7,7 +7,7 @@
 #include "portable_endian.h"
 #include "uthash.h"
 
-#define N2N_KCP_INTERVAL_MS 5
+#define N2N_KCP_INTERVAL_MS 10
 #define N2N_KCP_SNDBUF_WND 256
 #define N2N_KCP_RCVBUF_WND 256
 #define N2N_KCP_DEFAULT_MTU 1200
@@ -27,6 +27,103 @@ typedef struct n2n_kcp_sn_output_ctx {
         struct sockaddr_storage sas;
     } addr;
 } n2n_kcp_sn_output_ctx_t;
+
+static IUINT32 n2n_kcp_max_segment_xmit (const ikcpcb *kcp) {
+    const struct IQUEUEHEAD *p;
+    IUINT32 max_xmit = 0;
+
+    if(!kcp)
+        return 0;
+
+    for(p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
+        const struct IKCPSEG *seg = iqueue_entry(p, const struct IKCPSEG, node);
+        if(seg->xmit > max_xmit)
+            max_xmit = seg->xmit;
+    }
+
+    return max_xmit;
+}
+
+
+static void n2n_kcp_apply_default_timeout_congestion (ikcpcb *kcp, IUINT32 prior_cwnd) {
+    if(!kcp)
+        return;
+
+    kcp->ssthresh = prior_cwnd / 2;
+    if(kcp->ssthresh < 2)
+        kcp->ssthresh = 2;
+    kcp->cwnd = 1;
+    kcp->incr = kcp->mss;
+}
+
+
+static void n2n_kcp_edge_on_timeout (ikcpcb *kcp, IUINT32 prior_cwnd) {
+    n2n_kcp_edge_output_ctx_t *ctx = (n2n_kcp_edge_output_ctx_t*)kcp->user;
+    n2n_sock_str_t sockbuf;
+    IUINT32 max_xmit = n2n_kcp_max_segment_xmit(kcp);
+    IUINT32 remaining_before_dead = (kcp->dead_link > max_xmit) ? (kcp->dead_link - max_xmit) : 0;
+
+    traceEvent(TRACE_NORMAL,
+               "KCP on_timeout to supernode [%s]: rx_rto=%u ms, remaining_before_dead=%u",
+               sock_to_cstr(sockbuf, &ctx->remote),
+               (unsigned int)kcp->rx_rto,
+               (unsigned int)remaining_before_dead);
+
+    n2n_kcp_apply_default_timeout_congestion(kcp, prior_cwnd);
+}
+
+
+static void n2n_kcp_sn_on_timeout (ikcpcb *kcp, IUINT32 prior_cwnd) {
+    n2n_kcp_sn_output_ctx_t *ctx = (n2n_kcp_sn_output_ctx_t*)kcp->user;
+    n2n_sock_t remote;
+    n2n_sock_str_t sockbuf;
+    IUINT32 max_xmit = n2n_kcp_max_segment_xmit(kcp);
+    IUINT32 remaining_before_dead = (kcp->dead_link > max_xmit) ? (kcp->dead_link - max_xmit) : 0;
+
+    fill_n2nsock(&remote, &ctx->addr.sock);
+
+    traceEvent(TRACE_NORMAL,
+               "KCP on_timeout to edge [%s]: rx_rto=%u ms, remaining_before_dead=%u",
+               sock_to_cstr(sockbuf, &remote),
+               (unsigned int)kcp->rx_rto,
+               (unsigned int)remaining_before_dead);
+
+    n2n_kcp_apply_default_timeout_congestion(kcp, prior_cwnd);
+}
+
+
+static const struct IKCPOPS n2n_kcp_edge_ccops = {
+    "n2n-edge-kcp",
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    n2n_kcp_edge_on_timeout,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
+
+
+static const struct IKCPOPS n2n_kcp_sn_ccops = {
+    "n2n-sn-kcp",
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    n2n_kcp_sn_on_timeout,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
 
 static int n2n_kcp_raw_sendto (SOCKET fd, const uint8_t *buf, size_t len, const n2n_sock_t *dest) {
     struct sockaddr_in peer_addr;
@@ -110,7 +207,7 @@ static void n2n_kcp_configure (ikcpcb *kcp) {
     ikcp_wndsize(kcp, N2N_KCP_SNDBUF_WND, N2N_KCP_RCVBUF_WND);
     ikcp_setmtu(kcp, N2N_KCP_DEFAULT_MTU);
     kcp->rx_minrto = 10;
-    kcp->dead_link = 7;
+    kcp->dead_link = 10;
 }
 
 static int n2n_kcp_edge_output (const char *buf, int len, ikcpcb *kcp, void *user) {
@@ -144,6 +241,7 @@ int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
         return -1;
     }
     eee->sn_kcp.kcp->output = n2n_kcp_edge_output;
+    ikcp_setcc(eee->sn_kcp.kcp, &n2n_kcp_edge_ccops);
     n2n_kcp_configure(eee->sn_kcp.kcp);
     eee->sn_kcp.active = 1;
     eee->sn_kcp.rx_confirm_count = 0;
@@ -183,7 +281,7 @@ int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, con
         eee->sn_kcp.rx_confirm_count++;
     if(!eee->sn_kcp_confirmed && eee->sn_kcp.rx_confirm_count >= 2) {
         eee->sn_kcp_confirmed = 1;
-        traceEvent(TRACE_INFO, "KCP session to supernode [%s] established",
+        traceEvent(TRACE_NORMAL, "KCP session to supernode [%s] established",
                    sock_to_cstr(sockbuf, &sender));
     } else if(!eee->sn_kcp_confirmed) {
         traceEvent(TRACE_DEBUG,
@@ -248,6 +346,7 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd
         return NULL;
     }
     ctx->kcp->output = n2n_kcp_sn_output;
+    ikcp_setcc(ctx->kcp, &n2n_kcp_sn_ccops);
     n2n_kcp_configure(ctx->kcp);
     ctx->active = 1;
     ctx->last_seen = time(NULL);

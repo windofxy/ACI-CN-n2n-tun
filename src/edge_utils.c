@@ -721,10 +721,6 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
     if(eee->sn_kcp.kcp->state != (IUINT32)-1)
         return;
 
-    traceEvent(TRACE_WARNING,
-               "KCP session to supernode [%s] reached dead_link threshold, switching to TCP fallback",
-               supernode_ip(eee));
-
     /* Drop the dead KCP session first so a failed TCP connect does not
      * trigger a new fallback attempt every select cycle. */
     n2n_kcp_ctx_term(&eee->sn_kcp);
@@ -735,8 +731,6 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
          * refresh the supernode association without waiting for the normal
          * register interval. */
         eee->sn_wait = 2;
-        traceEvent(TRACE_NORMAL, "retrying current supernode [%s] over TCP after KCP session death",
-                   supernode_ip(eee));
     }
 }
 
@@ -2372,7 +2366,7 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
             edge_reset_register_super_request(eee);
             reset_sup_attempts(eee);
         } else if(edge_switch_to_tcp_supernode(eee, "supernode did not answer over UDP/KCP")) {
-            traceEvent(TRACE_NORMAL, "retrying current supernode [%s] over TCP", supernode_ip(eee));
+            /* TCP fallback already logged by edge_switch_to_tcp_supernode(). */
         } else {
             /* Give up on that supernode and try the next one. */
             sn_selection_criterion_bad(&(eee->curr_sn->selection_criterion));
