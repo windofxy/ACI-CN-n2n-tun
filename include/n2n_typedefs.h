@@ -270,6 +270,9 @@ typedef enum n2n_pc {
 #define N2N_FLAGS_OPTIONS                0x0080
 #define N2N_FLAGS_SOCKET                 0x0040
 #define N2N_FLAGS_FROM_SUPERNODE         0x0020
+#define N2N_FLAGS_PACKET_INNER_TCP       0x0100
+#define N2N_FLAGS_PACKET_INNER_UDP       0x0200
+#define N2N_FLAGS_PACKET_TRANSPORT_MASK  (N2N_FLAGS_PACKET_INNER_TCP | N2N_FLAGS_PACKET_INNER_UDP)
 
 /* The bits in flag that are the packet type */
 #define N2N_FLAGS_TYPE_MASK              0x001f  /* 0 - 31 */
@@ -468,12 +471,6 @@ struct peer_info {
     uint8_t                          local;
     time_t                           uptime;
     n2n_version_t                    version;
-    n2n_packet_queue_entry_t         *pending_packet_queue_head;         /**< queued oversized business packets while waiting for KCP on UDP */
-    n2n_packet_queue_entry_t         *pending_packet_queue_tail;         /**< tail pointer for queued oversized business packets */
-    size_t                           pending_packet_queue_count;         /**< number of queued oversized business packets */
-    size_t                           pending_packet_queue_bytes;         /**< total bytes in queued oversized business packets */
-    uint8_t                          kcp_wait_attempted;                /**< whether this peer already consumed its one-shot KCP wait window */
-
     UT_hash_handle     hh; /* makes this structure hashable */
 };
 
@@ -489,6 +486,11 @@ typedef struct n2n_kcp_ctx {
 
     UT_hash_handle                    hh;
 } n2n_kcp_ctx_t;
+
+typedef enum n2n_kcp_channel {
+    N2N_KCP_CHANNEL_CTRL = 0,
+    N2N_KCP_CHANNEL_DATA = 1
+} n2n_kcp_channel_t;
 
 typedef enum n2n_sn_transport {
     N2N_SN_TRANSPORT_UDP = 0,
@@ -759,7 +761,8 @@ struct n2n_edge {
     uint8_t                          kcp_probe_pending;                  /**< whether a KCP recovery probe is in flight */
     n2n_cookie_t                     kcp_probe_cookie;                   /**< cookie associated with the outstanding KCP probe */
     time_t                           last_kcp_probe;                     /**< last KCP recovery probe timestamp */
-    uint8_t                          sn_kcp_confirmed;                   /**< whether the current supernode has replied with a valid KCP packet */
+    uint8_t                          sn_kcp_ctrl_confirmed;              /**< whether the current supernode has replied with a valid control-plane KCP packet */
+    uint8_t                          sn_kcp_data_confirmed;              /**< whether the current supernode has replied with a valid data-plane KCP packet */
     uint32_t                         last_register_req_ms;               /**< last REGISTER_SUPER send attempt time in ms */
     uint8_t                          register_fast_retry_count;          /**< current fast retry backoff stage for REGISTER_SUPER */
     uint8_t                          tcp_register_soft_retry_budget;     /**< remaining TCP soft retries for REGISTER_SUPER during fallback */
@@ -770,11 +773,19 @@ struct n2n_edge {
     uint8_t                          current_supernode_rx_transport;     /**< current transport used by the supernode packet being processed */
     n2n_cookie_t                     register_super_cookie;              /**< cookie reused across one REGISTER_SUPER retry sequence */
     n2n_auth_t                       register_super_auth;                /**< auth token reused across one REGISTER_SUPER retry sequence */
-    n2n_kcp_ctx_t                    sn_kcp;                             /**< KCP session for supernode UDP transport. */
-    n2n_packet_queue_entry_t         *pending_packet_queue_head;         /**< queued ethernet frames while fallback transport is establishing */
-    n2n_packet_queue_entry_t         *pending_packet_queue_tail;         /**< tail pointer for queued ethernet frames */
-    size_t                           pending_packet_queue_count;         /**< number of queued ethernet frames */
-    size_t                           pending_packet_queue_bytes;         /**< total bytes in queued ethernet frames */
+    n2n_kcp_ctx_t                    sn_kcp_ctrl;                        /**< Control-plane KCP session for supernode UDP transport. */
+    n2n_kcp_ctx_t                    sn_kcp_data;                        /**< Data-plane KCP session for supernode UDP transport. */
+#ifdef _WIN32
+    n2n_packet_queue_entry_t         *tap_tx_queue_head;                 /**< queued TAP frames awaiting main-thread send processing */
+    n2n_packet_queue_entry_t         *tap_tx_queue_tail;                 /**< tail pointer for queued TAP frames */
+    size_t                           tap_tx_queue_count;                /**< number of queued TAP frames */
+    size_t                           tap_tx_queue_bytes;                /**< total bytes in queued TAP frames */
+    int                              tap_tx_wake_rx_sock;              /**< loopback UDP wake socket monitored by the main thread */
+    int                              tap_tx_wake_tx_sock;              /**< loopback UDP wake socket used by the TUN reader thread */
+    uint16_t                         tap_tx_wake_port;                 /**< bound port for the loopback wake socket */
+    uint8_t                          tap_tx_wake_pending;              /**< whether a wake signal is already outstanding for queued TAP frames */
+    volatile long                    tap_tx_queue_lock;                /**< lightweight Windows-only lock guarding the TAP send queue */
+#endif
 
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
     n2n_sock_t                       multicast_peer;                     /**< Multicast peer group (for local edges) */
@@ -898,7 +909,8 @@ typedef struct n2n_sn {
     int                                    tcp_sock;        /* auxiliary socket for optional TCP connections */
     n2n_tcp_connection_t                   *tcp_connections;/* list of established TCP connections */
     int                                    mgmt_sock;       /* management socket. */
-    n2n_kcp_ctx_t                          *udp_kcp_connections; /* KCP sessions carried over UDP. */
+    n2n_kcp_ctx_t                          *udp_kcp_ctrl_connections; /* Control-plane KCP sessions carried over UDP. */
+    n2n_kcp_ctx_t                          *udp_kcp_data_connections; /* Data-plane KCP sessions carried over UDP. */
     n2n_ip_subnet_t                        min_auto_ip_net; /* Address range of auto_ip service. */
     n2n_ip_subnet_t                        max_auto_ip_net; /* Address range of auto_ip service. */
 #ifndef _WIN32

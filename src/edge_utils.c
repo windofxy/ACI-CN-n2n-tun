@@ -44,13 +44,18 @@
 #define N2N_TCP_REGISTER_SOFT_RETRIES 2
 #define N2N_KCP_PRIME_BURST_SENDS 1
 #define N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS 2
-#define N2N_PENDING_PACKET_QUEUE_MAX_PACKETS 256
-#define N2N_PENDING_PACKET_QUEUE_MAX_BYTES (2 * 1024 * 1024)
-#define N2N_PENDING_PACKET_QUEUE_MAX_AGE_MS 3000
+#define N2N_TAP_TX_QUEUE_MAX_PACKETS 1024
+#define N2N_TAP_TX_QUEUE_MAX_BYTES (4 * 1024 * 1024)
+#define N2N_TAP_TX_DRAIN_BUDGET 128
 #define N2N_RX_SUPERNODE_TRANSPORT_NONE 0
 #define N2N_RX_SUPERNODE_TRANSPORT_UDP  1
 #define N2N_RX_SUPERNODE_TRANSPORT_TCP  2
 #define N2N_RX_SUPERNODE_TRANSPORT_KCP  3
+
+enum n2n_edge_transport_policy {
+    N2N_EDGE_TRANSPORT_POLICY_DEFAULT = 0,
+    N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP = 1
+};
 
 #ifdef _WIN32
 #include "win32/defs.h"
@@ -91,6 +96,10 @@ static void check_peer_registration_needed (n2n_edge_t *eee,
 
 static int edge_init_sockets (n2n_edge_t *eee);
 static void edge_reset_supernode_kcp_state (n2n_edge_t *eee, const char *reason);
+#ifdef _WIN32
+static int edge_init_tap_tx_queue (n2n_edge_t *eee);
+static void edge_term_tap_tx_queue (n2n_edge_t *eee, const char *reason);
+#endif
 
 static void check_known_peer_sock_change (n2n_edge_t *eee,
                                           uint8_t from_supernode,
@@ -314,24 +323,32 @@ static int edge_transport_uses_tcp (const n2n_edge_t *eee) {
 
 
 static void edge_reset_supernode_kcp_state (n2n_edge_t *eee, const char *reason) {
+    int had_kcp;
+    const n2n_sock_t *remote = NULL;
+    n2n_sock_str_t sockbuf;
 
     if(!eee)
         return;
 
-    if(eee->sn_kcp.active || eee->sn_kcp_confirmed) {
-        n2n_sock_str_t sockbuf;
-        const char *remote = eee->sn_kcp.active
-                           ? sock_to_cstr(sockbuf, &eee->sn_kcp.remote_sock)
-                           : supernode_ip(eee);
+    had_kcp = (eee->sn_kcp_ctrl.active || eee->sn_kcp_ctrl_confirmed
+            || eee->sn_kcp_data.active || eee->sn_kcp_data_confirmed);
 
+    if(eee->sn_kcp_ctrl.active)
+        remote = &eee->sn_kcp_ctrl.remote_sock;
+    else if(eee->sn_kcp_data.active)
+        remote = &eee->sn_kcp_data.remote_sock;
+
+    if(had_kcp) {
         traceEvent(TRACE_DEBUG,
                    "resetting edge KCP session to supernode [%s]: %s",
-                   remote,
+                   remote ? sock_to_cstr(sockbuf, remote) : supernode_ip(eee),
                    reason ? reason : "unspecified");
     }
 
-    n2n_kcp_ctx_term(&eee->sn_kcp);
-    eee->sn_kcp_confirmed = 0;
+    n2n_kcp_ctx_term(&eee->sn_kcp_ctrl);
+    n2n_kcp_ctx_term(&eee->sn_kcp_data);
+    eee->sn_kcp_ctrl_confirmed = 0;
+    eee->sn_kcp_data_confirmed = 0;
 }
 
 
@@ -377,98 +394,115 @@ static int edge_recent_supernode_udp_activity (const n2n_edge_t *eee, time_t now
 
 static int edge_recent_supernode_kcp_activity (const n2n_edge_t *eee, time_t now) {
 
-    if(!eee || !eee->sn_kcp.active || !eee->sn_kcp_confirmed || !eee->sn_kcp.last_seen)
+    if(!eee || !eee->sn_kcp_ctrl.active || !eee->sn_kcp_ctrl_confirmed || !eee->sn_kcp_ctrl.last_seen)
         return 0;
 
-    return ((now - eee->sn_kcp.last_seen) <= N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS);
+    return ((now - eee->sn_kcp_ctrl.last_seen) <= N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS);
 }
 
-
-static void edge_drop_oldest_pending_packet (n2n_edge_t *eee, const char *reason) {
-
-    n2n_packet_queue_entry_t *entry;
-
-    if(!eee || !eee->pending_packet_queue_head)
-        return;
-
-    entry = eee->pending_packet_queue_head;
-    eee->pending_packet_queue_head = entry->next;
-    if(!eee->pending_packet_queue_head)
-        eee->pending_packet_queue_tail = NULL;
-
-    if(eee->pending_packet_queue_count > 0)
-        eee->pending_packet_queue_count--;
-    if(eee->pending_packet_queue_bytes >= entry->len)
-        eee->pending_packet_queue_bytes -= entry->len;
-    else
-        eee->pending_packet_queue_bytes = 0;
-
-    if(reason) {
-        traceEvent(TRACE_DEBUG,
-                   "dropping queued fallback packet of %u bytes (%s)",
-                   (unsigned int)entry->len,
-                   reason);
-    } else {
-        traceEvent(TRACE_DEBUG,
-                   "dropping queued fallback packet of %u bytes",
-                   (unsigned int)entry->len);
-    }
-
-    free(entry);
-}
-
-
-static void edge_purge_pending_packets (n2n_edge_t *eee, uint32_t now_ms) {
-
-    while(eee && eee->pending_packet_queue_head) {
-        n2n_packet_queue_entry_t *entry = eee->pending_packet_queue_head;
-
-        if((uint32_t)(now_ms - entry->enqueue_ms) <= N2N_PENDING_PACKET_QUEUE_MAX_AGE_MS)
-            break;
-
-        edge_drop_oldest_pending_packet(eee, "expired while waiting for fallback transport");
-    }
-}
-
-
-static void edge_clear_pending_packet_queue (n2n_edge_t *eee, const char *reason) {
+#ifdef _WIN32
+static void edge_tap_tx_lock (n2n_edge_t *eee) {
 
     if(!eee)
         return;
 
-    while(eee->pending_packet_queue_head)
-        edge_drop_oldest_pending_packet(eee, reason);
+    while(InterlockedCompareExchange((volatile LONG*)&eee->tap_tx_queue_lock, 1, 0) != 0)
+        Sleep(0);
 }
 
 
-static void edge_queue_pending_packet (n2n_edge_t *eee, const uint8_t *tap_pkt, size_t len) {
+static void edge_tap_tx_unlock (n2n_edge_t *eee) {
+
+    if(!eee)
+        return;
+
+    InterlockedExchange((volatile LONG*)&eee->tap_tx_queue_lock, 0);
+}
+
+
+static void edge_tap_tx_drop_oldest_locked (n2n_edge_t *eee, const char *reason) {
 
     n2n_packet_queue_entry_t *entry;
-    uint32_t now_ms;
+    int level = TRACE_DEBUG;
+
+    if(!eee || !eee->tap_tx_queue_head)
+        return;
+
+    entry = eee->tap_tx_queue_head;
+    eee->tap_tx_queue_head = entry->next;
+    if(!eee->tap_tx_queue_head)
+        eee->tap_tx_queue_tail = NULL;
+
+    if(eee->tap_tx_queue_count > 0)
+        eee->tap_tx_queue_count--;
+    if(eee->tap_tx_queue_bytes >= entry->len)
+        eee->tap_tx_queue_bytes -= entry->len;
+    else
+        eee->tap_tx_queue_bytes = 0;
+
+    if(!eee->tap_tx_queue_head)
+        eee->tap_tx_wake_pending = 0;
+
+    if(reason && strstr(reason, "limit"))
+        level = TRACE_WARNING;
+
+    traceEvent(level,
+               "dropping queued TAP packet of %u bytes%s%s",
+               (unsigned int)entry->len,
+               reason ? ": " : "",
+               reason ? reason : "");
+    free(entry);
+}
+
+
+static int edge_tap_tx_queue_has_pending (n2n_edge_t *eee) {
+
+    int has_pending;
+
+    if(!eee)
+        return 0;
+
+    edge_tap_tx_lock(eee);
+    has_pending = (eee->tap_tx_queue_head != NULL);
+    edge_tap_tx_unlock(eee);
+
+    return has_pending;
+}
+
+
+static void edge_tap_tx_signal_main_thread (n2n_edge_t *eee) {
+
+    struct sockaddr_in wake_addr;
+    uint8_t marker = 0x1;
+
+    if(!eee || eee->tap_tx_wake_tx_sock < 0 || eee->tap_tx_wake_port == 0)
+        return;
+
+    memset(&wake_addr, 0, sizeof(wake_addr));
+    wake_addr.sin_family = AF_INET;
+    wake_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    wake_addr.sin_port = htons(eee->tap_tx_wake_port);
+
+    if(sendto(eee->tap_tx_wake_tx_sock, (const char*)&marker, sizeof(marker), 0,
+              (struct sockaddr*)&wake_addr, sizeof(wake_addr)) < 0) {
+        traceEvent(TRACE_DEBUG, "failed to wake main thread for queued TAP traffic: WSA=%u",
+                   WSAGetLastError());
+    }
+}
+
+
+static void edge_queue_tap_tx_packet (n2n_edge_t *eee, const uint8_t *tap_pkt, size_t len) {
+
+    n2n_packet_queue_entry_t *entry;
+    int was_empty;
+    int need_wake = 0;
 
     if(!eee || !tap_pkt || !len)
         return;
 
-    if(len > 0xFFFF || len > N2N_PENDING_PACKET_QUEUE_MAX_BYTES) {
+    if(len > 0xFFFF || len > N2N_TAP_TX_QUEUE_MAX_BYTES) {
         traceEvent(TRACE_WARNING,
-                   "dropping packet of %u bytes: too large for fallback queue",
-                   (unsigned int)len);
-        return;
-    }
-
-    now_ms = n2n_kcp_now_ms();
-    edge_purge_pending_packets(eee, now_ms);
-
-    while(eee->pending_packet_queue_head
-       && ((eee->pending_packet_queue_count >= N2N_PENDING_PACKET_QUEUE_MAX_PACKETS)
-        || ((eee->pending_packet_queue_bytes + len) > N2N_PENDING_PACKET_QUEUE_MAX_BYTES))) {
-        edge_drop_oldest_pending_packet(eee, "queue limit reached");
-    }
-
-    if((eee->pending_packet_queue_count >= N2N_PENDING_PACKET_QUEUE_MAX_PACKETS)
-    || ((eee->pending_packet_queue_bytes + len) > N2N_PENDING_PACKET_QUEUE_MAX_BYTES)) {
-        traceEvent(TRACE_WARNING,
-                   "dropping packet of %u bytes: fallback queue is full",
+                   "dropping TAP packet of %u bytes: too large for main-thread queue",
                    (unsigned int)len);
         return;
     }
@@ -476,74 +510,195 @@ static void edge_queue_pending_packet (n2n_edge_t *eee, const uint8_t *tap_pkt, 
     entry = calloc(1, sizeof(*entry) + len);
     if(!entry) {
         traceEvent(TRACE_WARNING,
-                   "dropping packet of %u bytes: cannot allocate fallback queue entry",
+                   "dropping TAP packet of %u bytes: cannot allocate main-thread queue entry",
                    (unsigned int)len);
         return;
     }
 
-    entry->enqueue_ms = now_ms;
+    entry->enqueue_ms = n2n_kcp_now_ms();
     entry->len = (uint16_t)len;
     memcpy(entry->data, tap_pkt, len);
 
-    if(eee->pending_packet_queue_tail)
-        eee->pending_packet_queue_tail->next = entry;
-    else
-        eee->pending_packet_queue_head = entry;
+    edge_tap_tx_lock(eee);
 
-    eee->pending_packet_queue_tail = entry;
-    eee->pending_packet_queue_count++;
-    eee->pending_packet_queue_bytes += len;
+    while(eee->tap_tx_queue_head
+       && ((eee->tap_tx_queue_count >= N2N_TAP_TX_QUEUE_MAX_PACKETS)
+        || ((eee->tap_tx_queue_bytes + len) > N2N_TAP_TX_QUEUE_MAX_BYTES))) {
+        edge_tap_tx_drop_oldest_locked(eee, "main-thread TAP queue limit reached");
+    }
 
-    traceEvent(TRACE_DEBUG,
-               "queued %u-byte packet for fallback transport recovery (%u packets, %u bytes queued)",
-               (unsigned int)len,
-               (unsigned int)eee->pending_packet_queue_count,
-               (unsigned int)eee->pending_packet_queue_bytes);
-}
-
-
-static void edge_flush_pending_packet_queue (n2n_edge_t *eee) {
-
-    uint32_t now_ms;
-
-    if(!eee || !eee->pending_packet_queue_head)
-        return;
-
-    if(eee->sn_wait) {
-        traceEvent(TRACE_DEBUG,
-                   "deferring queued fallback packet flush until supernode registration is complete");
+    if((eee->tap_tx_queue_count >= N2N_TAP_TX_QUEUE_MAX_PACKETS)
+    || ((eee->tap_tx_queue_bytes + len) > N2N_TAP_TX_QUEUE_MAX_BYTES)) {
+        edge_tap_tx_unlock(eee);
+        traceEvent(TRACE_WARNING,
+                   "dropping TAP packet of %u bytes: main-thread queue is full",
+                   (unsigned int)len);
+        free(entry);
         return;
     }
 
-    now_ms = n2n_kcp_now_ms();
-    edge_purge_pending_packets(eee, now_ms);
+    was_empty = (eee->tap_tx_queue_head == NULL);
 
-    if(!eee->pending_packet_queue_head)
+    if(eee->tap_tx_queue_tail)
+        eee->tap_tx_queue_tail->next = entry;
+    else
+        eee->tap_tx_queue_head = entry;
+
+    eee->tap_tx_queue_tail = entry;
+    eee->tap_tx_queue_count++;
+    eee->tap_tx_queue_bytes += len;
+
+    if(was_empty && !eee->tap_tx_wake_pending) {
+        eee->tap_tx_wake_pending = 1;
+        need_wake = 1;
+    }
+
+    edge_tap_tx_unlock(eee);
+
+    if(need_wake)
+        edge_tap_tx_signal_main_thread(eee);
+}
+
+
+static void edge_tap_tx_drain_wake_socket (n2n_edge_t *eee) {
+
+    uint8_t discard[64];
+    struct sockaddr_in sender;
+    int sender_len = sizeof(sender);
+    int bread;
+
+    if(!eee || eee->tap_tx_wake_rx_sock < 0)
         return;
 
-    traceEvent(TRACE_INFO,
-               "flushing %u queued fallback packets (%u bytes) after supernode registration recovery",
-               (unsigned int)eee->pending_packet_queue_count,
-               (unsigned int)eee->pending_packet_queue_bytes);
+    do {
+        bread = recvfrom(eee->tap_tx_wake_rx_sock, (char*)discard, sizeof(discard), 0,
+                         (struct sockaddr*)&sender, &sender_len);
+    } while(bread > 0);
+}
 
-    while(eee->pending_packet_queue_head && !eee->sn_wait) {
-        n2n_packet_queue_entry_t *entry = eee->pending_packet_queue_head;
 
-        eee->pending_packet_queue_head = entry->next;
-        if(!eee->pending_packet_queue_head)
-            eee->pending_packet_queue_tail = NULL;
+static n2n_packet_queue_entry_t *edge_tap_tx_dequeue_packet (n2n_edge_t *eee) {
 
-        if(eee->pending_packet_queue_count > 0)
-            eee->pending_packet_queue_count--;
-        if(eee->pending_packet_queue_bytes >= entry->len)
-            eee->pending_packet_queue_bytes -= entry->len;
+    n2n_packet_queue_entry_t *entry;
+
+    if(!eee)
+        return NULL;
+
+    edge_tap_tx_lock(eee);
+
+    entry = eee->tap_tx_queue_head;
+    if(entry) {
+        eee->tap_tx_queue_head = entry->next;
+        if(!eee->tap_tx_queue_head)
+            eee->tap_tx_queue_tail = NULL;
+
+        if(eee->tap_tx_queue_count > 0)
+            eee->tap_tx_queue_count--;
+        if(eee->tap_tx_queue_bytes >= entry->len)
+            eee->tap_tx_queue_bytes -= entry->len;
         else
-            eee->pending_packet_queue_bytes = 0;
+            eee->tap_tx_queue_bytes = 0;
+
+        if(!eee->tap_tx_queue_head)
+            eee->tap_tx_wake_pending = 0;
+    }
+
+    edge_tap_tx_unlock(eee);
+
+    return entry;
+}
+
+
+static void edge_flush_tap_tx_queue (n2n_edge_t *eee) {
+
+    int budget = N2N_TAP_TX_DRAIN_BUDGET;
+
+    if(!eee)
+        return;
+
+    while(budget-- > 0) {
+        n2n_packet_queue_entry_t *entry = edge_tap_tx_dequeue_packet(eee);
+
+        if(!entry)
+            break;
 
         edge_send_packet2net(eee, entry->data, entry->len);
         free(entry);
     }
 }
+
+
+static void edge_clear_tap_tx_queue (n2n_edge_t *eee, const char *reason) {
+
+    if(!eee)
+        return;
+
+    edge_tap_tx_lock(eee);
+    while(eee->tap_tx_queue_head)
+        edge_tap_tx_drop_oldest_locked(eee, reason);
+    edge_tap_tx_unlock(eee);
+}
+
+
+static int edge_init_tap_tx_queue (n2n_edge_t *eee) {
+
+    struct sockaddr_in wake_addr;
+    int wake_addr_len = sizeof(wake_addr);
+    u_long nonblocking = 1;
+
+    if(!eee)
+        return -1;
+
+    eee->tap_tx_wake_rx_sock = open_socket(0, INADDR_LOOPBACK, 0 /* UDP */);
+    if(eee->tap_tx_wake_rx_sock < 0) {
+        traceEvent(TRACE_ERROR, "failed to create TAP wake receive socket");
+        return -1;
+    }
+
+    eee->tap_tx_wake_tx_sock = open_socket(0, INADDR_LOOPBACK, 0 /* UDP */);
+    if(eee->tap_tx_wake_tx_sock < 0) {
+        traceEvent(TRACE_ERROR, "failed to create TAP wake send socket");
+        return -1;
+    }
+
+    if(getsockname(eee->tap_tx_wake_rx_sock, (struct sockaddr*)&wake_addr, &wake_addr_len) != 0) {
+        traceEvent(TRACE_ERROR, "failed to query TAP wake receive socket address: WSA=%u", WSAGetLastError());
+        return -1;
+    }
+
+    eee->tap_tx_wake_port = ntohs(wake_addr.sin_port);
+
+    if(ioctlsocket(eee->tap_tx_wake_rx_sock, FIONBIO, &nonblocking) != 0) {
+        traceEvent(TRACE_ERROR, "failed to make TAP wake receive socket nonblocking: WSA=%u", WSAGetLastError());
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static void edge_term_tap_tx_queue (n2n_edge_t *eee, const char *reason) {
+
+    if(!eee)
+        return;
+
+    edge_clear_tap_tx_queue(eee, reason);
+
+    if(eee->tap_tx_wake_rx_sock >= 0) {
+        closesocket(eee->tap_tx_wake_rx_sock);
+        eee->tap_tx_wake_rx_sock = -1;
+    }
+
+    if(eee->tap_tx_wake_tx_sock >= 0) {
+        closesocket(eee->tap_tx_wake_tx_sock);
+        eee->tap_tx_wake_tx_sock = -1;
+    }
+
+    eee->tap_tx_wake_port = 0;
+    eee->tap_tx_wake_pending = 0;
+    eee->tap_tx_queue_lock = 0;
+}
+#endif
 
 
 static void edge_sync_active_socket (n2n_edge_t *eee) {
@@ -744,23 +899,29 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
     if(!eee || edge_transport_is_forced_tcp(eee) || edge_transport_uses_tcp(eee))
         return;
 
-    if(!eee->sn_kcp.active || !eee->sn_kcp.kcp)
+    if(eee->sn_kcp_data.active && eee->sn_kcp_data.kcp && (eee->sn_kcp_data.kcp->state == (IUINT32)-1)) {
+        traceEvent(TRACE_DEBUG, "resetting dead data KCP session to supernode [%s]", supernode_ip(eee));
+        n2n_kcp_ctx_term(&eee->sn_kcp_data);
+        eee->sn_kcp_data_confirmed = 0;
+    }
+
+    if(!eee->sn_kcp_ctrl.active || !eee->sn_kcp_ctrl.kcp)
         return;
 
-    if(eee->sn_kcp.kcp->state != (IUINT32)-1)
+    if(eee->sn_kcp_ctrl.kcp->state != (IUINT32)-1)
         return;
 
     /* Drop the dead KCP session first so a failed TCP connect does not
      * trigger a new fallback attempt every select cycle. */
-    edge_reset_supernode_kcp_state(eee, "KCP session reached dead_link threshold");
+    edge_reset_supernode_kcp_state(eee, "control KCP session reached dead_link threshold");
 
-    if(edge_switch_to_tcp_supernode(eee, "KCP session reached dead_link threshold")) {
+    if(edge_switch_to_tcp_supernode(eee, "control KCP session reached dead_link threshold")) {
         /* Reuse the existing immediate re-register path so TCP fallback can
          * refresh the supernode association without waiting for the normal
          * register interval. */
         eee->sn_wait = 2;
     } else {
-        edge_recycle_udp_supernode_socket(eee, "KCP session reached dead_link threshold");
+        edge_recycle_udp_supernode_socket(eee, "control KCP session reached dead_link threshold");
         reset_sup_attempts(eee);
         eee->sn_wait = 2;
     }
@@ -898,7 +1059,8 @@ int supernode_connect (n2n_edge_t *eee) {
     if(!eee)
         return -1;
 
-    if(eee->sn_kcp.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp.remote_sock))
+    if((eee->sn_kcp_ctrl.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp_ctrl.remote_sock))
+    || (eee->sn_kcp_data.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp_data.remote_sock)))
         edge_reset_supernode_kcp_state(eee, "current supernode socket changed");
 
     if(eee->tcp_sn_sock_valid && !edge_dest_is_current_supernode(eee, &eee->tcp_sn_sock))
@@ -1028,7 +1190,8 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     memcpy(&eee->conf, conf, sizeof(*conf));
     eee->curr_sn = eee->conf.supernodes;
     eee->start_time = time(NULL);
-    n2n_kcp_ctx_init(&eee->sn_kcp);
+    n2n_kcp_ctx_init(&eee->sn_kcp_ctrl);
+    n2n_kcp_ctx_init(&eee->sn_kcp_data);
 
     eee->known_peers        = NULL;
     eee->pending_peers    = NULL;
@@ -1138,7 +1301,8 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     eee->kcp_probe_pending = 0;
     eee->kcp_probe_cookie = 0;
     eee->last_kcp_probe = 0;
-    eee->sn_kcp_confirmed = 0;
+    eee->sn_kcp_ctrl_confirmed = 0;
+    eee->sn_kcp_data_confirmed = 0;
     eee->last_register_req_ms = 0;
     eee->register_fast_retry_count = 0;
     eee->tcp_register_soft_retry_budget = 0;
@@ -1149,10 +1313,17 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
     eee->register_super_cookie = 0;
     memset(&eee->register_super_auth, 0, sizeof(eee->register_super_auth));
-    eee->pending_packet_queue_head = NULL;
-    eee->pending_packet_queue_tail = NULL;
-    eee->pending_packet_queue_count = 0;
-    eee->pending_packet_queue_bytes = 0;
+#ifdef _WIN32
+    eee->tap_tx_queue_head = NULL;
+    eee->tap_tx_queue_tail = NULL;
+    eee->tap_tx_queue_count = 0;
+    eee->tap_tx_queue_bytes = 0;
+    eee->tap_tx_wake_rx_sock = -1;
+    eee->tap_tx_wake_tx_sock = -1;
+    eee->tap_tx_wake_port = 0;
+    eee->tap_tx_wake_pending = 0;
+    eee->tap_tx_queue_lock = 0;
+#endif
     eee->udp_mgmt_sock = -1;
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
     eee->udp_multicast_sock = -1;
@@ -1161,6 +1332,13 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
         traceEvent(TRACE_ERROR, "socket setup failed");
         goto edge_init_error;
     }
+
+#ifdef _WIN32
+    if(edge_init_tap_tx_queue(eee) < 0) {
+        traceEvent(TRACE_ERROR, "failed to initialize Windows TAP main-thread send queue");
+        goto edge_init_error;
+    }
+#endif
 
     if(resolve_create_thread(&(eee->resolve_parameter), eee->conf.supernodes) == 0) {
         traceEvent(TRACE_NORMAL, "successfully created resolver thread");
@@ -1174,8 +1352,12 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     return(eee);
 
 edge_init_error:
-    if(eee)
+    if(eee) {
+#ifdef _WIN32
+        edge_term_tap_tx_queue(eee, "edge init failure");
+#endif
         free(eee);
+    }
     *rv = rc;
     return(NULL);
 }
@@ -1258,6 +1440,44 @@ static int find_peer_time_stamp_and_verify (n2n_edge_t * eee,
 
     // failure --> 0;    success --> 1
     return time_stamp_verify_and_update(stamp, previous_stamp, allow_jitter);
+}
+
+
+static uint16_t edge_packet_transport_flags (const uint8_t *tap_pkt, size_t len) {
+
+    const ether_hdr_t *eh;
+
+    if(!tap_pkt || len < sizeof(ether_hdr_t))
+        return 0;
+
+    eh = (const ether_hdr_t*)tap_pkt;
+
+    if(ntohs(eh->type) == 0x0800) {
+        const struct n2n_iphdr *hdr_ip;
+        size_t ip_len = len - sizeof(ether_hdr_t);
+
+        if(ip_len < sizeof(struct n2n_iphdr))
+            return 0;
+
+        hdr_ip = (const struct n2n_iphdr*)(tap_pkt + sizeof(ether_hdr_t));
+        if((hdr_ip->version != 4) || (hdr_ip->ihl < 5) || (ip_len < ((size_t)hdr_ip->ihl * 4u)))
+            return 0;
+
+        if(hdr_ip->protocol == 0x06)
+            return N2N_FLAGS_PACKET_INNER_TCP;
+        if(hdr_ip->protocol == 0x11)
+            return N2N_FLAGS_PACKET_INNER_UDP;
+    }
+
+    return 0;
+}
+
+static int edge_transport_policy_from_flags (uint16_t flags) {
+
+    if(flags & N2N_FLAGS_PACKET_INNER_TCP)
+        return N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP;
+
+    return N2N_EDGE_TRANSPORT_POLICY_DEFAULT;
 }
 
 
@@ -1702,7 +1922,8 @@ static int check_sock_ready (n2n_edge_t *eee) {
 /** Send a datagram to a socket file descriptor */
 static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
                           size_t len, struct sockaddr_in *dest,
-                          const n2n_sock_t * n2ndest) {
+                          const n2n_sock_t * n2ndest,
+                          int transport_policy) {
 
     ssize_t sent = 0;
     int sock_errno = 0;
@@ -1724,35 +1945,46 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
     }
 
     if((!edge_transport_uses_tcp(eee)) && n2ndest && sock_equal(n2ndest, &(eee->curr_sn->sock))) {
-        if(eee->sn_kcp.active && eee->sn_kcp_confirmed) {
-            int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
+        if(eee->sending_supernode_control) {
+            if(eee->sn_kcp_ctrl.active && eee->sn_kcp_ctrl_confirmed) {
+                int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest, N2N_KCP_CHANNEL_CTRL);
+                if(kcp_sent >= 0) {
+                    traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
+                    return kcp_sent;
+                }
+            }
+
+            should_prime_kcp = (eee->conf.prefer_kcp && !eee->sn_kcp_ctrl_confirmed);
+
+            if(should_prime_kcp) {
+                int prime_attempt;
+                int prime_successes = 0;
+
+                for(prime_attempt = 0; prime_attempt < N2N_KCP_PRIME_BURST_SENDS; ++prime_attempt) {
+                    int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest, N2N_KCP_CHANNEL_CTRL);
+                    if(kcp_sent < 0)
+                        break;
+
+                    prime_successes++;
+                }
+
+                if(prime_successes > 0) {
+                    traceEvent(TRACE_DEBUG,
+                               "primed control KCP for supernode [%s] with %d mirrored UDP-compatible control sends",
+                               sock_to_cstr(sockbuf, n2ndest),
+                               prime_successes);
+                }
+            }
+        } else if(transport_policy == N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP) {
+            traceEvent(TRACE_DEBUG,
+                       "routing %u-byte payload to supernode [%s] via raw UDP due to INNER_TCP hint",
+                       (unsigned int)len,
+                       sock_to_cstr(sockbuf, n2ndest));
+        } else if(eee->conf.prefer_kcp && eee->sn_kcp_ctrl_confirmed) {
+            int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest, N2N_KCP_CHANNEL_DATA);
             if(kcp_sent >= 0) {
                 traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
                 return kcp_sent;
-            }
-        }
-
-        should_prime_kcp = (eee->conf.prefer_kcp
-                         && eee->sending_supernode_control
-                         && !eee->sn_kcp_confirmed);
-
-        if(should_prime_kcp) {
-            int prime_attempt;
-            int prime_successes = 0;
-
-            for(prime_attempt = 0; prime_attempt < N2N_KCP_PRIME_BURST_SENDS; ++prime_attempt) {
-                int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest);
-                if(kcp_sent < 0)
-                    break;
-
-                prime_successes++;
-            }
-
-            if(prime_successes > 0) {
-                traceEvent(TRACE_DEBUG,
-                           "primed KCP for supernode [%s] with %d mirrored UDP-compatible control sends",
-                           sock_to_cstr(sockbuf, n2ndest),
-                           prime_successes);
             }
         }
     }
@@ -1866,7 +2098,8 @@ err_out:
 
 /** Send a datagram to a socket defined by a n2n_sock_t */
 static void sendto_sock (n2n_edge_t *eee, const void * buf,
-                            size_t len, const n2n_sock_t * dest) {
+                            size_t len, const n2n_sock_t * dest,
+                            int transport_policy) {
 
     struct sockaddr_in peer_addr;
     ssize_t sent;
@@ -1903,13 +2136,14 @@ static void sendto_sock (n2n_edge_t *eee, const void * buf,
 
         // prepend packet length...
         uint16_t pktsize16 = htobe16(len);
-        sent = sendto_fd(eee, (uint8_t*)&pktsize16, sizeof(pktsize16), &peer_addr, dest);
+        sent = sendto_fd(eee, (uint8_t*)&pktsize16, sizeof(pktsize16), &peer_addr, dest,
+                         N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
 
         if(sent <= 0)
             return;
         // ...before sending the actual data
     }
-    sent = sendto_fd(eee, buf, len, &peer_addr, dest);
+    sent = sendto_fd(eee, buf, len, &peer_addr, dest, transport_policy);
 
     // if the connection is tcp, i.e. not the regular sock...
     if(edge_transport_uses_tcp(eee)) {
@@ -1998,7 +2232,8 @@ void send_query_peer (n2n_edge_t * eee,
         }
 
         eee->sending_supernode_control = 1;
-        sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
+        sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock),
+                    N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
         eee->sending_supernode_control = 0;
 
     } else {
@@ -2036,7 +2271,8 @@ void send_query_peer (n2n_edge_t * eee,
                 // done with the remaining (do not send anymore)
                 break;
             }
-            sendto_sock(eee, pktbuf, idx, &(peer->sock));
+            sendto_sock(eee, pktbuf, idx, &(peer->sock),
+                        N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
         }
         eee->sending_supernode_control = 0;
     }
@@ -2088,8 +2324,11 @@ void send_register_super (n2n_edge_t *eee) {
     idx = 0;
     encode_REGISTER_SUPER(pktbuf, &idx, &cmn, &reg);
 
-    traceEvent(TRACE_DEBUG, "send REGISTER_SUPER to [%s]",
-               sock_to_cstr(sockbuf, &(eee->curr_sn->sock)));
+    traceEvent(TRACE_DEBUG,
+               "Tx REGISTER_SUPER to supernode [%s] via %s (cookie=%u)",
+               sock_to_cstr(sockbuf, &(eee->curr_sn->sock)),
+               edge_transport_uses_tcp(eee) ? "TCP" : ((eee->sn_kcp_ctrl.active && eee->sn_kcp_ctrl_confirmed) ? "KCP" : "UDP"),
+               (unsigned int)reg.cookie);
 
     if(eee->conf.header_encryption == HEADER_ENCRYPTION_ENABLED) {
         packet_header_encrypt(pktbuf, idx, idx,
@@ -2106,7 +2345,8 @@ void send_register_super (n2n_edge_t *eee) {
     eee->sending_register_super = 1;
     eee->sending_supernode_control = 1;
     eee->register_super_soft_retry_armed = 0;
-    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
+    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock),
+                N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
     eee->sending_register_super = 0;
     eee->sending_supernode_control = 0;
     eee->register_super_soft_retry_armed = 0;
@@ -2146,7 +2386,8 @@ static void send_unregister_super (n2n_edge_t *eee) {
                               time_stamp());
 
     eee->sending_supernode_control = 1;
-    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
+    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock),
+                N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
     eee->sending_supernode_control = 0;
 
 }
@@ -2171,7 +2412,7 @@ static int sort_supernodes (n2n_edge_t *eee, time_t now) {
             reset_sup_attempts(eee);
             supernode_connect(eee);
 
-            traceEvent(TRACE_INFO, "registering with supernode [%s][number of supernodes %d][attempts left %u]",
+            traceEvent(TRACE_DEBUG, "registering with supernode [%s][number of supernodes %d][attempts left %u]",
                        supernode_ip(eee), HASH_COUNT(eee->conf.supernodes), (unsigned int)eee->sup_attempts);
 
             send_register_super(eee);
@@ -2250,7 +2491,8 @@ static void send_register (n2n_edge_t * eee,
 
     if(edge_dest_is_current_supernode(eee, remote_peer))
         eee->sending_supernode_control = 1;
-    sendto_sock(eee, pktbuf, idx, remote_peer);
+    sendto_sock(eee, pktbuf, idx, remote_peer,
+                N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
     eee->sending_supernode_control = 0;
 }
 
@@ -2296,7 +2538,8 @@ static void send_register_ack (n2n_edge_t * eee,
                               eee->conf.header_encryption_ctx_dynamic, eee->conf.header_iv_ctx_dynamic,
                               time_stamp());
 
-    sendto_sock(eee, pktbuf, idx, remote_peer);
+    sendto_sock(eee, pktbuf, idx, remote_peer,
+                N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
 }
 
 /* ************************************** */
@@ -2410,8 +2653,8 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
             eee->register_fast_retry_count = 0;
             eee->tcp_register_soft_retry_budget = 0;
             eee->register_super_soft_retry_armed = 0;
-            edge_reset_register_super_request(eee);
             reset_sup_attempts(eee);
+            return;
         } else if(!edge_transport_is_forced_tcp(eee)
                && !edge_transport_uses_tcp(eee)
                && edge_recent_supernode_kcp_activity(eee, now)) {
@@ -2422,8 +2665,8 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
             eee->register_fast_retry_count = 0;
             eee->tcp_register_soft_retry_budget = 0;
             eee->register_super_soft_retry_armed = 0;
-            edge_reset_register_super_request(eee);
             reset_sup_attempts(eee);
+            return;
         } else if(edge_switch_to_tcp_supernode(eee, "supernode did not answer over UDP/KCP")) {
             /* TCP fallback already logged by edge_switch_to_tcp_supernode(). */
         } else {
@@ -2487,7 +2730,7 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
 #ifndef HAVE_LIBPTHREAD
     if(supernode2sock(&(eee->curr_sn->sock), eee->curr_sn->ip_addr) == 0) {
 #endif
-        traceEvent(TRACE_INFO, "registering with supernode [%s][number of supernodes %d][attempts left %u]",
+        traceEvent(TRACE_DEBUG, "registering with supernode [%s][number of supernodes %d][attempts left %u]",
                    supernode_ip(eee), HASH_COUNT(eee->conf.supernodes), (unsigned int)eee->sup_attempts);
 
         send_register_super(eee);
@@ -2833,7 +3076,8 @@ static int find_peer_destination (n2n_edge_t * eee,
 static int send_packet (n2n_edge_t * eee,
                         n2n_mac_t dstMac,
                         const uint8_t * pktbuf,
-                        size_t pktlen) {
+                        size_t pktlen,
+                        int transport_policy) {
 
     int is_p2p;
     /*ssize_t s; */
@@ -2869,13 +3113,14 @@ static int send_packet (n2n_edge_t * eee,
         // if no supernode around, foward the broadcast to all known peers
         if(eee->sn_wait) {
             HASH_ITER(hh, eee->known_peers, peer, tmp_peer)
-                sendto_sock(eee, pktbuf, pktlen, &peer->sock);
+                sendto_sock(eee, pktbuf, pktlen, &peer->sock,
+                            N2N_EDGE_TRANSPORT_POLICY_DEFAULT);
             return 0;
         }
         // fall through otherwise
     }
 
-    sendto_sock(eee, pktbuf, pktlen, &destination);
+    sendto_sock(eee, pktbuf, pktlen, &destination, transport_policy);
 
     return 0;
 }
@@ -2936,21 +3181,10 @@ void edge_send_packet2net (n2n_edge_t * eee,
     }
 #endif
 
-    if(edge_tcp_fallback_is_establishing(eee)) {
-        macstr_t mac_buf;
-
-        traceEvent(TRACE_DEBUG,
-                   "queueing raw packet for %s while TCP fallback to supernode [%s] is still establishing",
-                   macaddr_str(mac_buf, destMac),
-                   supernode_ip(eee));
-        edge_queue_pending_packet(eee, tap_pkt, len);
-        return;
-    }
-
     memset(&cmn, 0, sizeof(cmn));
     cmn.ttl = N2N_DEFAULT_TTL;
     cmn.pc = n2n_packet;
-    cmn.flags = 0; /* no options, not from supernode, no socket */
+    cmn.flags = edge_packet_transport_flags(tap_pkt, len);
     memcpy(cmn.community, eee->conf.community_name, N2N_COMMUNITY_SIZE);
 
     memset(&pkt, 0, sizeof(pkt));
@@ -3031,7 +3265,8 @@ void edge_send_packet2net (n2n_edge_t * eee,
 
     eee->transop.tx_cnt++; /* stats */
 
-    send_packet(eee, destMac, pktbuf, idx); /* to peer or supernode */
+    send_packet(eee, destMac, pktbuf, idx,
+                edge_transport_policy_from_flags(cmn.flags)); /* to peer or supernode */
 }
 
 /* ************************************** */
@@ -3098,7 +3333,11 @@ void edge_read_from_tap (n2n_edge_t * eee) {
                 len = tmp_len;
             }
 
+#ifdef _WIN32
+            edge_queue_tap_tx_packet(eee, eth_pkt, len);
+#else
             edge_send_packet2net(eee, eth_pkt, len);
+#endif
         }
     }
 }
@@ -3416,12 +3655,13 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                 if(is_valid_peer_sock(&ra.sock))
                     orig_sender = &(ra.sock);
 
-                traceEvent(TRACE_INFO, "Rx REGISTER_SUPER_ACK from %s [%s] (external %s) via %s with %u attempts left",
+                traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER_ACK from %s [%s] (external %s) via %s with %u attempts left (cookie=%u)",
                            macaddr_str(mac_buf1, ra.srcMac),
                            sock_to_cstr(sockbuf1, &sender),
                            sock_to_cstr(sockbuf2, orig_sender),
                            edge_supernode_rx_transport_str(eee->current_supernode_rx_transport),
-                           (unsigned int)eee->sup_attempts);
+                           (unsigned int)eee->sup_attempts,
+                           (unsigned int)ra.cookie);
 
                 eee->close_socket_counter = 0;
 
@@ -3486,8 +3726,6 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                 eee->register_super_soft_retry_armed = 0;
                 edge_reset_register_super_request(eee);
                 reset_sup_attempts(eee); /* refresh because we got a response */
-                edge_flush_pending_packet_queue(eee);
-
                 // update last_sup only on 'real' REGISTER_SUPER_ACKs, not on bootstrap ones (own MAC address
                 // still null_mac) this allows reliable in/out PACKET drop if not really registered with a supernode yet
                 if(!is_null_mac(eee->device.mac_addr)) {
@@ -3602,7 +3840,7 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                         SN_SELECTION_CRITERION_DATA_TYPE sn_sel_tmp = pi.load;
                         sn_selection_criterion_calculate(eee, scan, &sn_sel_tmp);
 
-                        traceEvent(TRACE_INFO, "Rx PONG from supernode %s version '%s'",
+                        traceEvent(TRACE_DEBUG, "Rx PONG from supernode %s version '%s'",
                                    macaddr_str(mac_buf1, pi.srcMac),
                                    pi.version);
 
@@ -3722,15 +3960,21 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
             if((eee->udp_sock >= 0) && (sock == eee->udp_sock)) {
                 uint8_t kcp_out[N2N_PKT_BUF_SIZE];
                 ssize_t kcp_out_len = 0;
-                if(n2n_kcp_edge_input(eee, sender_sock, pktbuf, bread, now, kcp_out, sizeof(kcp_out), &kcp_out_len)) {
-                    if(eee->tcp_fallback_active)
+                n2n_kcp_channel_t kcp_channel = N2N_KCP_CHANNEL_CTRL;
+                int kcp_rc = n2n_kcp_edge_input(eee, sender_sock, pktbuf, bread, now,
+                                                kcp_out, sizeof(kcp_out), &kcp_out_len,
+                                                &kcp_channel);
+                if(kcp_rc != 0) {
+                    if(eee->tcp_fallback_active && (kcp_channel == N2N_KCP_CHANNEL_CTRL))
                         edge_mark_udp_recovered(eee, "received KCP packet from supernode");
-                    while(kcp_out_len > 0) {
-                        eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_KCP;
-                        process_udp(eee, sender_sock, sock, kcp_out, kcp_out_len, now);
-                        eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
-                        if(!n2n_kcp_edge_recv_pending(eee, kcp_out, sizeof(kcp_out), &kcp_out_len))
-                            break;
+                    if(kcp_rc > 0) {
+                        while(kcp_out_len > 0) {
+                            eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_KCP;
+                            process_udp(eee, sender_sock, sock, kcp_out, kcp_out_len, now);
+                            eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_NONE;
+                            if(!n2n_kcp_edge_recv_pending(eee, kcp_channel, kcp_out, sizeof(kcp_out), &kcp_out_len))
+                                break;
+                        }
                     }
                 } else {
                     eee->current_supernode_rx_transport = N2N_RX_SUPERNODE_TRANSPORT_UDP;
@@ -3854,6 +4098,12 @@ int run_edge_loop (n2n_edge_t *eee) {
             FD_SET(eee->sock, &socket_mask);
             max_sock = max(eee->sock, eee->udp_mgmt_sock);
         }
+#ifdef _WIN32
+        if(eee->tap_tx_wake_rx_sock >= 0) {
+            FD_SET(eee->tap_tx_wake_rx_sock, &socket_mask);
+            max_sock = max(max_sock, eee->tap_tx_wake_rx_sock);
+        }
+#endif
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
         if((eee->conf.allow_p2p)
         && (eee->conf.preferred_sock.family == (uint8_t)AF_INVALID)) {
@@ -3867,7 +4117,16 @@ int run_edge_loop (n2n_edge_t *eee) {
         max_sock = max(max_sock, eee->device.fd);
 #endif
 
-        if(eee->sn_kcp.active) {
+        if(
+#ifdef _WIN32
+           edge_tap_tx_queue_has_pending(eee)
+#else
+           0
+#endif
+          ) {
+            wait_time.tv_sec = 0;
+            wait_time.tv_usec = 0;
+        } else if(eee->sn_kcp_ctrl.active || eee->sn_kcp_data.active) {
             int wait_ms = n2n_kcp_edge_wait_timeout_ms(eee, 10);
             wait_time.tv_sec = wait_ms / 1000;
             wait_time.tv_usec = (wait_ms % 1000) * 1000;
@@ -3933,6 +4192,11 @@ int run_edge_loop (n2n_edge_t *eee) {
                     break;
             }
 
+#ifdef _WIN32
+            if((eee->tap_tx_wake_rx_sock >= 0) && FD_ISSET(eee->tap_tx_wake_rx_sock, &socket_mask))
+                edge_tap_tx_drain_wake_socket(eee);
+#endif
+
 #ifndef _WIN32
             if(FD_ISSET(eee->device.fd, &socket_mask)) {
                 // read an ethernet frame from the TAP socket; write on the IP socket
@@ -3941,11 +4205,14 @@ int run_edge_loop (n2n_edge_t *eee) {
 #endif
         }
 
+#ifdef _WIN32
+        edge_flush_tap_tx_queue(eee);
+#endif
+
         // finished processing select data
         n2n_kcp_edge_update(eee);
         edge_handle_dead_kcp_session(eee);
         update_supernode_reg(eee, now);
-        edge_purge_pending_packets(eee, n2n_kcp_now_ms());
 
         numPurged = 0;
         // keep, i.e. do not purge, the known peers while no supernode supernode connection
@@ -4034,7 +4301,9 @@ void edge_term (n2n_edge_t * eee) {
     clear_peer_list(&eee->pending_peers);
     clear_peer_list(&eee->known_peers);
     clear_peer_list(&eee->conf.supernodes);
-    edge_clear_pending_packet_queue(eee, "edge shutdown");
+#ifdef _WIN32
+    edge_term_tap_tx_queue(eee, "edge shutdown");
+#endif
 
 #ifdef HAVE_BRIDGING_SUPPORT
     if(eee->conf.allow_routing) {

@@ -1332,11 +1332,6 @@ int main (int argc, char* argv[]) {
     eee->sending_supernode_control = 0;
     eee->register_super_cookie = 0;
     memset(&eee->register_super_auth, 0, sizeof(eee->register_super_auth));
-    eee->pending_packet_queue_head = NULL;
-    eee->pending_packet_queue_tail = NULL;
-    eee->pending_packet_queue_count = 0;
-    eee->pending_packet_queue_bytes = 0;
-
 #ifndef _WIN32
     if(eee->tuntap_priv_conf.daemon) {
         setUseSyslog(1); /* traceEvent output now goes to syslog. */

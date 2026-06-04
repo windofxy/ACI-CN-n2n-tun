@@ -1,0 +1,21 @@
+05/Jun/2026 01:10:11 [sn_utils.c:499] added allowed community 'mynetwork' [total: 1]
+05/Jun/2026 01:10:11 [sn_utils.c:1469] assigned sub-network 10.164.148.0/24 to community 'mynetwork'
+05/Jun/2026 01:10:11 [sn_utils.c:499] added allowed community 'netleo' [total: 2]
+05/Jun/2026 01:10:11 [sn_utils.c:1469] assigned sub-network 10.139.204.0/24 to community 'netleo'
+05/Jun/2026 01:10:11 [sn_utils.c:474] added regular expression for allowed communities 'ntop[0-1][0-9]'
+05/Jun/2026 01:10:11 [sn_utils.c:499] added allowed community 'home' [total: 3]
+05/Jun/2026 01:10:11 [sn_utils.c:526] assigned sub-network 192.168.168.0/24 to community 'home'
+05/Jun/2026 01:10:11 [sn_utils.c:544] loaded 3 fixed-name communities from community.list
+05/Jun/2026 01:10:11 [sn_utils.c:547] loaded 1 regular expressions for community name matching from community.list
+05/Jun/2026 01:10:11 [sn_utils.c:219] started shared secrets calculation for edge authentication
+05/Jun/2026 01:10:11 [sn_utils.c:235] calculated shared secrets for edge authentication
+05/Jun/2026 01:10:11 [sn_utils.c:244] calculating dynamic keys
+05/Jun/2026 01:10:11 [supernode.c:650] WARNING: using default federation name; FOR TESTING ONLY, usage of a custom federation name (-F) is highly recommended!
+05/Jun/2026 01:10:11 [sn_utils.c:219] started shared secrets calculation for edge authentication
+05/Jun/2026 01:10:11 [sn_utils.c:235] calculated shared secrets for edge authentication
+05/Jun/2026 01:10:11 [supernode.c:666] supernode is listening on UDP 18002 (main)
+05/Jun/2026 01:10:11 [supernode.c:675] supernode opened TCP 18002 (aux)
+05/Jun/2026 01:10:11 [supernode.c:682] supernode is listening on TCP 18002 (aux)
+05/Jun/2026 01:10:11 [supernode.c:691] supernode is listening on UDP 15645 (management)
+05/Jun/2026 01:10:11 [supernode.c:734] supernode started
+05/Jun/2026 01:10:11 [supernode.c:750] enabled 1ms Windows timer period for lower-latency KCP scheduling

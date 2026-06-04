@@ -164,15 +164,15 @@ int sock_equal (const n2n_sock_t * a,
 uint32_t n2n_kcp_now_ms (void);
 void n2n_kcp_ctx_init (n2n_kcp_ctx_t *ctx);
 void n2n_kcp_ctx_term (n2n_kcp_ctx_t *ctx);
-int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote);
-int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2n_sock_t *dest);
-int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
-int n2n_kcp_edge_recv_pending (n2n_edge_t *eee, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
+int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote, n2n_kcp_channel_t channel);
+int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2n_sock_t *dest, n2n_kcp_channel_t channel);
+int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len, n2n_kcp_channel_t *out_channel);
+int n2n_kcp_edge_recv_pending (n2n_edge_t *eee, n2n_kcp_channel_t channel, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
 void n2n_kcp_edge_update (n2n_edge_t *eee);
 int n2n_kcp_edge_wait_timeout_ms (const n2n_edge_t *eee, int default_ms);
-int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *socket, const uint8_t *pktbuf, size_t pktsize);
-int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
-int n2n_kcp_sn_recv_pending (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
+int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *socket, const uint8_t *pktbuf, size_t pktsize, n2n_kcp_channel_t channel);
+int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, const uint8_t *buf, size_t len, time_t now, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len, n2n_kcp_channel_t *out_channel);
+int n2n_kcp_sn_recv_pending (n2n_sn_t *sss, const struct sockaddr *sender_sock, socklen_t sender_len, n2n_kcp_channel_t channel, uint8_t *out_buf, size_t out_buf_size, ssize_t *out_len);
 void n2n_kcp_sn_update (n2n_sn_t *sss);
 int n2n_kcp_sn_wait_timeout_ms (const n2n_sn_t *sss, int default_ms);
 
