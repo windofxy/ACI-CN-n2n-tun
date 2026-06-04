@@ -312,8 +312,13 @@ int supernode2sock (n2n_sock_t *sn, const n2n_sn_name_t addrIn) {
     const struct addrinfo aihints = {0, PF_INET, 0, 0, 0, NULL, NULL, NULL};
     struct addrinfo * ainfo = NULL;
     struct sockaddr_in * saddr;
+    n2n_sock_t resolved;
 
-    sn->family = AF_INVALID;
+    if(!sn)
+        return -4;
+
+    memset(&resolved, 0, sizeof(resolved));
+    resolved.family = (uint8_t)AF_INVALID;
 
     memcpy(addr, addrIn, N2N_EDGE_SN_HOST_SIZE);
     supernode_host = strtok(addr, ":");
@@ -321,15 +326,15 @@ int supernode2sock (n2n_sock_t *sn, const n2n_sn_name_t addrIn) {
     if(supernode_host) {
         supernode_port = strtok(NULL, ":");
         if(supernode_port) {
-            sn->port = atoi(supernode_port);
+            resolved.port = atoi(supernode_port);
             nameerr = getaddrinfo(supernode_host, NULL, &aihints, &ainfo);
             if(0 == nameerr) {
                /* ainfo s the head of a linked list if non-NULL. */
                 if(ainfo && (PF_INET == ainfo->ai_family)) {
                     /* It is definitely and IPv4 address -> sockaddr_in */
                     saddr = (struct sockaddr_in *)ainfo->ai_addr;
-                    memcpy(sn->addr.v4, &(saddr->sin_addr.s_addr), IPV4_SIZE);
-                    sn->family = AF_INET;
+                    memcpy(resolved.addr.v4, &(saddr->sin_addr.s_addr), IPV4_SIZE);
+                    resolved.family = AF_INET;
                     traceEvent(TRACE_DEBUG, "supernode2sock successfully resolves supernode IPv4 address for %s", supernode_host);
                     rv = 0;
                 } else {
@@ -353,6 +358,9 @@ int supernode2sock (n2n_sock_t *sn, const n2n_sn_name_t addrIn) {
     }
 
     ainfo = NULL;
+
+    if(rv == 0)
+        memcpy(sn, &resolved, sizeof(*sn));
 
     return rv;
 }

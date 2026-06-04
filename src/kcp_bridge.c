@@ -5,6 +5,7 @@
 #include "n2n.h"
 #include "n2n_wire.h"
 #include "portable_endian.h"
+#include "random_numbers.h"
 #include "uthash.h"
 
 #define N2N_KCP_INTERVAL_MS 10
@@ -12,8 +13,10 @@
 #define N2N_KCP_RCVBUF_WND 256
 #define N2N_KCP_DEFAULT_MTU 1200
 #define N2N_KCP_OVERHEAD 24
-#define N2N_KCP_FIXED_CONV 0x4e324e31u
-
+#define N2N_KCP_CMD_PUSH 81u
+#define N2N_KCP_CMD_ACK  82u
+#define N2N_KCP_CMD_WASK 83u
+#define N2N_KCP_CMD_WINS 84u
 typedef struct n2n_kcp_edge_output_ctx {
     n2n_edge_t *eee;
     n2n_sock_t remote;
@@ -63,11 +66,12 @@ static void n2n_kcp_edge_on_timeout (ikcpcb *kcp, IUINT32 prior_cwnd) {
     IUINT32 max_xmit = n2n_kcp_max_segment_xmit(kcp);
     IUINT32 remaining_before_dead = (kcp->dead_link > max_xmit) ? (kcp->dead_link - max_xmit) : 0;
 
-    traceEvent(TRACE_NORMAL,
-               "KCP on_timeout to supernode [%s]: rx_rto=%u ms, remaining_before_dead=%u",
-               sock_to_cstr(sockbuf, &ctx->remote),
-               (unsigned int)kcp->rx_rto,
-               (unsigned int)remaining_before_dead);
+    if(remaining_before_dead == 0) {
+        traceEvent(TRACE_NORMAL,
+                   "KCP session to supernode [%s] reached dead_link threshold (rx_rto=%u ms)",
+                   sock_to_cstr(sockbuf, &ctx->remote),
+                   (unsigned int)kcp->rx_rto);
+    }
 
     n2n_kcp_apply_default_timeout_congestion(kcp, prior_cwnd);
 }
@@ -82,11 +86,12 @@ static void n2n_kcp_sn_on_timeout (ikcpcb *kcp, IUINT32 prior_cwnd) {
 
     fill_n2nsock(&remote, &ctx->addr.sock);
 
-    traceEvent(TRACE_NORMAL,
-               "KCP on_timeout to edge [%s]: rx_rto=%u ms, remaining_before_dead=%u",
-               sock_to_cstr(sockbuf, &remote),
-               (unsigned int)kcp->rx_rto,
-               (unsigned int)remaining_before_dead);
+    if(remaining_before_dead == 0) {
+        traceEvent(TRACE_NORMAL,
+                   "KCP session to edge [%s] reached dead_link threshold (rx_rto=%u ms)",
+                   sock_to_cstr(sockbuf, &remote),
+                   (unsigned int)kcp->rx_rto);
+    }
 
     n2n_kcp_apply_default_timeout_congestion(kcp, prior_cwnd);
 }
@@ -158,6 +163,58 @@ static int n2n_kcp_packet_matches_conv (const uint8_t *buf, size_t len, uint32_t
     return ikcp_getconv(buf) == conv;
 }
 
+static uint32_t n2n_kcp_read_le32 (const uint8_t *p) {
+    return ((uint32_t)p[0])
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static int n2n_kcp_cmd_is_valid (uint8_t cmd) {
+    return (cmd == N2N_KCP_CMD_PUSH)
+        || (cmd == N2N_KCP_CMD_ACK)
+        || (cmd == N2N_KCP_CMD_WASK)
+        || (cmd == N2N_KCP_CMD_WINS);
+}
+
+static int n2n_kcp_packet_get_conv (const uint8_t *buf, size_t len, uint32_t *conv) {
+    const uint8_t *p = buf;
+    size_t remaining = len;
+    uint32_t packet_conv;
+
+    if(conv)
+        *conv = 0;
+
+    if(!buf || !conv || len < (size_t)N2N_KCP_OVERHEAD)
+        return 0;
+
+    packet_conv = ikcp_getconv(buf);
+
+    while(remaining >= (size_t)N2N_KCP_OVERHEAD) {
+        uint32_t seg_conv = n2n_kcp_read_le32(p);
+        uint8_t cmd = p[4];
+        uint32_t seg_len = n2n_kcp_read_le32(p + 20);
+
+        if(seg_conv != packet_conv)
+            return 0;
+
+        if(!n2n_kcp_cmd_is_valid(cmd))
+            return 0;
+
+        if(seg_len > (remaining - (size_t)N2N_KCP_OVERHEAD))
+            return 0;
+
+        p += N2N_KCP_OVERHEAD + seg_len;
+        remaining -= N2N_KCP_OVERHEAD + seg_len;
+    }
+
+    if(remaining != 0)
+        return 0;
+
+    *conv = packet_conv;
+    return 1;
+}
+
 static int n2n_kcp_wait_timeout_ms_ctx (const n2n_kcp_ctx_t *ctx, uint32_t current_ms, int default_ms) {
     uint32_t next_update;
     uint32_t delta;
@@ -184,9 +241,13 @@ uint32_t n2n_kcp_now_ms (void) {
     return (uint32_t)(now_ms & 0xFFFFFFFFu);
 }
 
-uint32_t n2n_kcp_conv_for_sock (const n2n_sock_t *sock) {
-    (void)sock;
-    return N2N_KCP_FIXED_CONV;
+static uint32_t n2n_kcp_generate_conv (void) {
+    uint32_t conv = (uint32_t)(n2n_rand() & 0xFFFFFFFFu);
+
+    if(conv == 0)
+        conv = 1;
+
+    return conv;
 }
 
 void n2n_kcp_ctx_init (n2n_kcp_ctx_t *ctx) {
@@ -206,8 +267,8 @@ static void n2n_kcp_configure (ikcpcb *kcp) {
     ikcp_nodelay(kcp, 1, N2N_KCP_INTERVAL_MS, 2, 1);
     ikcp_wndsize(kcp, N2N_KCP_SNDBUF_WND, N2N_KCP_RCVBUF_WND);
     ikcp_setmtu(kcp, N2N_KCP_DEFAULT_MTU);
-    kcp->rx_minrto = 10;
-    kcp->dead_link = 10;
+    kcp->rx_minrto = 30;
+    kcp->dead_link = 15;
 }
 
 static int n2n_kcp_edge_output (const char *buf, int len, ikcpcb *kcp, void *user) {
@@ -222,18 +283,29 @@ static int n2n_kcp_sn_output (const char *buf, int len, ikcpcb *kcp, void *user)
     return (int)sendto(ctx->socket_fd, buf, len, 0, &ctx->addr.sock, ctx->sock_len);
 }
 
-int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
+static int n2n_kcp_edge_setup_with_conv (n2n_edge_t *eee, const n2n_sock_t *remote, uint32_t conv) {
     n2n_kcp_edge_output_ctx_t *user;
     n2n_sock_str_t sockbuf;
+    n2n_sock_str_t prev_sockbuf;
     if(!eee || !remote || eee->udp_sock < 0) return 0;
     if(eee->sn_kcp.active && sock_equal(&eee->sn_kcp.remote_sock, remote)) return 0;
+    if(eee->sn_kcp.active || eee->sn_kcp_confirmed) {
+        traceEvent(TRACE_NORMAL,
+                   "reinitializing edge KCP session from supernode [%s] to [%s] (old_family=%u old_port=%u new_family=%u new_port=%u)",
+                   eee->sn_kcp.active ? sock_to_cstr(prev_sockbuf, &eee->sn_kcp.remote_sock) : "unbound",
+                   sock_to_cstr(sockbuf, remote),
+                   (unsigned int)eee->sn_kcp.remote_sock.family,
+                   (unsigned int)eee->sn_kcp.remote_sock.port,
+                   (unsigned int)remote->family,
+                   (unsigned int)remote->port);
+    }
     n2n_kcp_ctx_term(&eee->sn_kcp);
     eee->sn_kcp_confirmed = 0;
     user = (n2n_kcp_edge_output_ctx_t*)calloc(1, sizeof(*user));
     if(!user) return -1;
     user->eee = eee;
     memcpy(&user->remote, remote, sizeof(*remote));
-    eee->sn_kcp.conv = n2n_kcp_conv_for_sock(remote);
+    eee->sn_kcp.conv = conv;
     memcpy(&eee->sn_kcp.remote_sock, remote, sizeof(*remote));
     eee->sn_kcp.kcp = ikcp_create(eee->sn_kcp.conv, user);
     if(!eee->sn_kcp.kcp) {
@@ -251,6 +323,10 @@ int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
     return 0;
 }
 
+int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote) {
+    return n2n_kcp_edge_setup_with_conv(eee, remote, n2n_kcp_generate_conv());
+}
+
 int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2n_sock_t *dest) {
     if(!eee || !buf || !dest || eee->udp_sock < 0) return -1;
     if(!sock_equal(dest, &eee->curr_sn->sock)) return -1;
@@ -264,19 +340,32 @@ int n2n_kcp_edge_input (n2n_edge_t *eee, const struct sockaddr *sender_sock, con
     n2n_sock_t sender;
     uint32_t conv;
     n2n_sock_str_t sockbuf;
+    int had_active_ctx;
 
     if(out_len) *out_len = 0;
     if(!eee || eee->udp_sock < 0 || !out_buf || !out_len) return 0;
     fill_n2nsock(&sender, sender_sock);
     if(!sock_equal(&sender, &eee->curr_sn->sock)) return 0;
-    conv = n2n_kcp_conv_for_sock(&sender);
-    if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
+    if(!n2n_kcp_packet_get_conv(buf, len, &conv)) return 0;
+    if(!eee->sn_kcp.active || !eee->sn_kcp.kcp || !sock_equal(&eee->sn_kcp.remote_sock, &sender))
+        return 0;
+    if(conv != eee->sn_kcp.conv)
+        return 0;
     traceEvent(TRACE_DEBUG,
                "received %u-byte KCP packet from supernode [%s]",
                (unsigned int)len,
                sock_to_cstr(sockbuf, &sender));
-    if(n2n_kcp_edge_setup(eee, &sender) != 0) return 0;
-    if(ikcp_input(eee->sn_kcp.kcp, (const char*)buf, (long)len) < 0) return 0;
+    had_active_ctx = (eee->sn_kcp.active && eee->sn_kcp.kcp && sock_equal(&eee->sn_kcp.remote_sock, &sender));
+    if(ikcp_input(eee->sn_kcp.kcp, (const char*)buf, (long)len) < 0) {
+        if(!had_active_ctx) {
+            traceEvent(TRACE_WARNING,
+                       "dropping freshly initialized KCP session to supernode [%s]: initial ikcp_input failed",
+                       sock_to_cstr(sockbuf, &sender));
+            n2n_kcp_ctx_term(&eee->sn_kcp);
+            eee->sn_kcp_confirmed = 0;
+        }
+        return 0;
+    }
     if(!eee->sn_kcp_confirmed && eee->sn_kcp.rx_confirm_count < 0xFF)
         eee->sn_kcp.rx_confirm_count++;
     if(!eee->sn_kcp_confirmed && eee->sn_kcp.rx_confirm_count >= 2) {
@@ -316,21 +405,54 @@ int n2n_kcp_edge_wait_timeout_ms (const n2n_edge_t *eee, int default_ms) {
     return n2n_kcp_wait_timeout_ms_ctx(&eee->sn_kcp, n2n_kcp_now_ms(), default_ms);
 }
 
-static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *sender_sock, socklen_t sender_len) {
+static void n2n_kcp_sn_drop_ctx (n2n_sn_t *sss, n2n_kcp_ctx_t *ctx, const char *reason) {
+    n2n_sock_str_t sockbuf;
+
+    if(!sss || !ctx)
+        return;
+
+    traceEvent(TRACE_WARNING,
+               "dropping KCP session for edge [%s]: %s",
+               sock_to_cstr(sockbuf, &ctx->remote_sock),
+               reason ? reason : "unspecified");
+
+    HASH_DEL(sss->udp_kcp_connections, ctx);
+    n2n_kcp_ctx_term(ctx);
+    free(ctx);
+}
+
+static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *sender_sock, socklen_t sender_len, uint32_t conv, int *created) {
     n2n_kcp_ctx_t *ctx;
     n2n_sock_t remote;
     n2n_kcp_sn_output_ctx_t *user;
     n2n_sock_str_t sockbuf;
+
+    if(created)
+        *created = 0;
+
     fill_n2nsock(&remote, sender_sock);
     HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), ctx);
     if(ctx) {
-        traceEvent(TRACE_DEBUG, "reusing KCP session for edge [%s]", sock_to_cstr(sockbuf, &remote));
-        return ctx;
+        if(ctx->kcp && ctx->kcp->state == (IUINT32)-1) {
+            n2n_kcp_sn_drop_ctx(sss, ctx, "edge sent new traffic after KCP dead_link");
+            ctx = NULL;
+        } else if(ctx->conv != conv) {
+            traceEvent(TRACE_NORMAL,
+                       "reinitializing KCP session for edge [%s] because conv changed from %u to %u",
+                       sock_to_cstr(sockbuf, &remote),
+                       (unsigned int)ctx->conv,
+                       (unsigned int)conv);
+            n2n_kcp_sn_drop_ctx(sss, ctx, "edge restarted KCP session with new conv");
+            ctx = NULL;
+        } else {
+            traceEvent(TRACE_DEBUG, "reusing KCP session for edge [%s]", sock_to_cstr(sockbuf, &remote));
+            return ctx;
+        }
     }
     ctx = (n2n_kcp_ctx_t*)calloc(1, sizeof(*ctx));
     if(!ctx) return NULL;
     memcpy(&ctx->remote_sock, &remote, sizeof(remote));
-    ctx->conv = n2n_kcp_conv_for_sock(&remote);
+    ctx->conv = conv;
     user = (n2n_kcp_sn_output_ctx_t*)calloc(1, sizeof(*user));
     if(!user) {
         free(ctx);
@@ -351,6 +473,8 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_or_create (n2n_sn_t *sss, SOCKET socket_fd
     ctx->active = 1;
     ctx->last_seen = time(NULL);
     HASH_ADD(hh, sss->udp_kcp_connections, remote_sock, sizeof(n2n_sock_t), ctx);
+    if(created)
+        *created = 1;
     traceEvent(TRACE_DEBUG, "created KCP session for edge [%s]", sock_to_cstr(sockbuf, &remote));
     return ctx;
 }
@@ -362,7 +486,7 @@ int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *soc
     n2n_sock_str_t sockbuf;
     if(!sss || !socket || socket_fd != sss->sock) return -1;
     fill_n2nsock(&remote, socket);
-    ctx = n2n_kcp_sn_find_or_create(sss, socket_fd, socket, sock_len);
+    HASH_FIND(hh, sss->udp_kcp_connections, &remote, sizeof(n2n_sock_t), ctx);
     if(!ctx) return -1;
     traceEvent(TRACE_DEBUG,
                "sending %u-byte payload to edge [%s] over KCP",
@@ -379,19 +503,24 @@ int n2n_kcp_sn_process_input (n2n_sn_t *sss, const struct sockaddr *sender_sock,
     n2n_sock_str_t sockbuf;
     uint32_t conv;
     int rc;
+    int created = 0;
     if(out_len) *out_len = 0;
     if(!sss || !sender_sock || !buf || !out_buf || !out_len) return 0;
     fill_n2nsock(&remote, sender_sock);
-    conv = n2n_kcp_conv_for_sock(&remote);
-    if(!n2n_kcp_packet_matches_conv(buf, len, conv)) return 0;
+    if(!n2n_kcp_packet_get_conv(buf, len, &conv)) return 0;
     traceEvent(TRACE_DEBUG,
                "received %u-byte KCP packet from edge [%s]",
                (unsigned int)len,
                sock_to_cstr(sockbuf, &remote));
-    ctx = n2n_kcp_sn_find_or_create(sss, sss->sock, sender_sock, sender_len);
+    ctx = n2n_kcp_sn_find_or_create(sss, sss->sock, sender_sock, sender_len, conv, &created);
     if(!ctx) return 0;
     rc = ikcp_input(ctx->kcp, (const char*)buf, (long)len);
-    if(rc < 0) return 0;
+    if(rc < 0) {
+        if(created) {
+            n2n_kcp_sn_drop_ctx(sss, ctx, "initial ikcp_input failed");
+        }
+        return 0;
+    }
     ctx->last_seen = now;
     ikcp_update(ctx->kcp, n2n_kcp_now_ms());
     n2n_kcp_recv_pending_ctx(ctx, out_buf, out_buf_size, out_len);
@@ -422,10 +551,12 @@ void n2n_kcp_sn_update (n2n_sn_t *sss) {
     if(!sss) return;
     HASH_ITER(hh, sss->udp_kcp_connections, ctx, tmp) {
         if(ctx->kcp) ikcp_update(ctx->kcp, now_ms);
+        if(ctx->kcp && ctx->kcp->state == (IUINT32)-1) {
+            n2n_kcp_sn_drop_ctx(sss, ctx, "KCP session reached dead_link threshold");
+            continue;
+        }
         if((now - ctx->last_seen) > 120) {
-            HASH_DEL(sss->udp_kcp_connections, ctx);
-            n2n_kcp_ctx_term(ctx);
-            free(ctx);
+            n2n_kcp_sn_drop_ctx(sss, ctx, "inactive for 120 seconds");
         }
     }
 }

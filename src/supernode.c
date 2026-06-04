@@ -255,6 +255,8 @@ static int setOption (int optkey, char *_optarg, n2n_sn_t *sss) {
             }
 
             socket = (n2n_sock_t *)calloc(1, sizeof(n2n_sock_t));
+            if(socket)
+                socket->family = (uint8_t)AF_INVALID;
             rv = supernode2sock(socket, _optarg);
 
             if(rv < -2) { /* we accept resolver failure as it might resolve later */

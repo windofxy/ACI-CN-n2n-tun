@@ -706,6 +706,7 @@ typedef struct n2n_edge_conf {
     int                      mgmt_port;
     uint8_t                  connect_tcp;            /** connection to supernode 0 = UDP; 1 = TCP */
     uint8_t                  prefer_kcp;            /** prefer KCP when communicating with the supernode over UDP */
+    uint8_t                  allow_tcp_fallback;    /** allow falling back from UDP/KCP to TCP for the supernode */
     n2n_auth_t               auth;
     filter_rule_t            *network_traffic_filter_rules;
     int                      metric;                /**< Network interface metric (Windows only). */

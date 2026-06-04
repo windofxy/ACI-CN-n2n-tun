@@ -303,10 +303,10 @@ static void help (int level) {
                "                   | useful if multicast peer detection is not available,\n"
                "                   | '-e auto' tries IP address auto-detection\n");
         printf(" -S1 ... -S3       | do not connect p2p, always use the supernode,\n"
-               "                   | -S1 = via UDP/KCP"
+               "                   | -S1 = via UDP/KCP only"
 
 #ifdef N2N_HAVE_TCP
-                                  ", -S2 = via TCP, -S3 = via UDP/KCP with TCP fallback"
+                                  ", -S2 = via TCP only, -S3 = via UDP/KCP with TCP fallback"
 #endif
 "\n");
         printf(" -i <reg_interval> | registration interval, for NAT hole punching (default\n"
@@ -732,12 +732,18 @@ static int setOption (int optkey, char *optargument, n2n_tuntap_priv_config_t *e
             if(solitude >= 1)
                 conf->allow_p2p = 0;
 #ifdef N2N_HAVE_TCP
-            if(solitude == 2) {
+            if(solitude == 1) {
+                conf->connect_tcp = 0;
+                conf->prefer_kcp = 1;
+                conf->allow_tcp_fallback = 0;
+            } else if(solitude == 2) {
                 conf->connect_tcp = 1;
                 conf->prefer_kcp = 0;
+                conf->allow_tcp_fallback = 0;
             } else if(solitude == 3) {
                 conf->connect_tcp = 0;
                 conf->prefer_kcp = 1;
+                conf->allow_tcp_fallback = 1;
             }
 #endif
             break;

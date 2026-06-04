@@ -162,7 +162,6 @@ int sock_equal (const n2n_sock_t * a,
 
 /* KCP */
 uint32_t n2n_kcp_now_ms (void);
-uint32_t n2n_kcp_conv_for_sock (const n2n_sock_t *sock);
 void n2n_kcp_ctx_init (n2n_kcp_ctx_t *ctx);
 void n2n_kcp_ctx_term (n2n_kcp_ctx_t *ctx);
 int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote);

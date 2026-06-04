@@ -90,6 +90,7 @@ static void check_peer_registration_needed (n2n_edge_t *eee,
                                             const n2n_sock_t *peer);
 
 static int edge_init_sockets (n2n_edge_t *eee);
+static void edge_reset_supernode_kcp_state (n2n_edge_t *eee, const char *reason);
 
 static void check_known_peer_sock_change (n2n_edge_t *eee,
                                           uint8_t from_supernode,
@@ -240,7 +241,9 @@ static void edge_set_active_transport (n2n_edge_t *eee, n2n_sn_transport_t trans
 static void tcp_enable_low_latency (SOCKET sockfd);
 static void tcp_begin_packet_send (SOCKET sockfd);
 static void tcp_end_packet_send (SOCKET sockfd);
+static int supernode_connect_udp_socket (n2n_edge_t *eee);
 static int supernode_connect_tcp_socket (n2n_edge_t *eee);
+static void edge_recycle_udp_supernode_socket (n2n_edge_t *eee, const char *reason);
 void edge_send_packet2net (n2n_edge_t * eee, uint8_t *tap_pkt, size_t len);
 
 
@@ -298,9 +301,37 @@ static int edge_transport_is_forced_tcp (const n2n_edge_t *eee) {
 }
 
 
+static int edge_transport_allows_tcp_fallback (const n2n_edge_t *eee) {
+
+    return (eee && eee->conf.allow_tcp_fallback);
+}
+
+
 static int edge_transport_uses_tcp (const n2n_edge_t *eee) {
 
     return (eee && (eee->active_sn_transport == N2N_SN_TRANSPORT_TCP));
+}
+
+
+static void edge_reset_supernode_kcp_state (n2n_edge_t *eee, const char *reason) {
+
+    if(!eee)
+        return;
+
+    if(eee->sn_kcp.active || eee->sn_kcp_confirmed) {
+        n2n_sock_str_t sockbuf;
+        const char *remote = eee->sn_kcp.active
+                           ? sock_to_cstr(sockbuf, &eee->sn_kcp.remote_sock)
+                           : supernode_ip(eee);
+
+        traceEvent(TRACE_DEBUG,
+                   "resetting edge KCP session to supernode [%s]: %s",
+                   remote,
+                   reason ? reason : "unspecified");
+    }
+
+    n2n_kcp_ctx_term(&eee->sn_kcp);
+    eee->sn_kcp_confirmed = 0;
 }
 
 
@@ -589,8 +620,7 @@ static void supernode_disconnect_udp (n2n_edge_t *eee) {
         traceEvent(TRACE_DEBUG, "closed UDP socket");
     }
 
-    n2n_kcp_ctx_term(&eee->sn_kcp);
-    eee->sn_kcp_confirmed = 0;
+    edge_reset_supernode_kcp_state(eee, "UDP socket closed");
 }
 
 
@@ -628,8 +658,7 @@ static void edge_release_tcp_sticky_after_disconnect (n2n_edge_t *eee, const cha
     eee->tcp_register_soft_retry_budget = 0;
     eee->register_super_soft_retry_armed = 0;
     edge_reset_register_super_request(eee);
-    n2n_kcp_ctx_term(&eee->sn_kcp);
-    eee->sn_kcp_confirmed = 0;
+    edge_reset_supernode_kcp_state(eee, "TCP fallback ended, returning to UDP/KCP");
     edge_set_active_transport(eee, N2N_SN_TRANSPORT_UDP);
     reset_sup_attempts(eee);
 }
@@ -723,13 +752,16 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
 
     /* Drop the dead KCP session first so a failed TCP connect does not
      * trigger a new fallback attempt every select cycle. */
-    n2n_kcp_ctx_term(&eee->sn_kcp);
-    eee->sn_kcp_confirmed = 0;
+    edge_reset_supernode_kcp_state(eee, "KCP session reached dead_link threshold");
 
     if(edge_switch_to_tcp_supernode(eee, "KCP session reached dead_link threshold")) {
         /* Reuse the existing immediate re-register path so TCP fallback can
          * refresh the supernode association without waiting for the normal
          * register interval. */
+        eee->sn_wait = 2;
+    } else {
+        edge_recycle_udp_supernode_socket(eee, "KCP session reached dead_link threshold");
+        reset_sup_attempts(eee);
         eee->sn_wait = 2;
     }
 }
@@ -866,10 +898,8 @@ int supernode_connect (n2n_edge_t *eee) {
     if(!eee)
         return -1;
 
-    if(eee->sn_kcp.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp.remote_sock)) {
-        n2n_kcp_ctx_term(&eee->sn_kcp);
-        eee->sn_kcp_confirmed = 0;
-    }
+    if(eee->sn_kcp.active && !edge_dest_is_current_supernode(eee, &eee->sn_kcp.remote_sock))
+        edge_reset_supernode_kcp_state(eee, "current supernode socket changed");
 
     if(eee->tcp_sn_sock_valid && !edge_dest_is_current_supernode(eee, &eee->tcp_sn_sock))
         supernode_disconnect_tcp(eee);
@@ -894,6 +924,9 @@ int supernode_connect (n2n_edge_t *eee) {
 int edge_switch_to_tcp_supernode (n2n_edge_t *eee, const char *reason) {
 #ifdef N2N_HAVE_TCP
     if(!eee || edge_transport_is_forced_tcp(eee) || edge_transport_uses_tcp(eee))
+        return 0;
+
+    if(!edge_transport_allows_tcp_fallback(eee))
         return 0;
 
     traceEvent(TRACE_WARNING,
@@ -939,6 +972,32 @@ void supernode_disconnect (n2n_edge_t *eee) {
     supernode_disconnect_tcp(eee);
     supernode_disconnect_udp(eee);
     eee->sock = -1;
+}
+
+
+static void edge_recycle_udp_supernode_socket (n2n_edge_t *eee, const char *reason) {
+
+    if(!eee || edge_transport_is_forced_tcp(eee))
+        return;
+
+    traceEvent(TRACE_WARNING,
+               "recycling UDP socket for supernode [%s]: %s",
+               supernode_ip(eee),
+               reason ? reason : "unspecified");
+
+    supernode_disconnect_udp(eee);
+
+    if(supernode_connect_udp_socket(eee) < 0) {
+        traceEvent(TRACE_WARNING,
+                   "failed to reopen UDP socket for supernode [%s]",
+                   supernode_ip(eee));
+        return;
+    }
+
+    if(!edge_transport_uses_tcp(eee))
+        edge_set_active_transport(eee, N2N_SN_TRANSPORT_UDP);
+
+    edge_sync_active_socket(eee);
 }
 
 /* ************************************** */
@@ -2383,6 +2442,9 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
             // privileges. as we are not able to check for sufficent privileges here, we only do it
             // if port is sufficently high or unset. uncovered: privileged port and sufficent privileges
             if((eee->conf.local_port == 0) || (eee->conf.local_port > 1024)) {
+                int close_socket_counter_max = edge_transport_allows_tcp_fallback(eee)
+                                             ? N2N_CLOSE_SOCKET_COUNTER_MAX
+                                             : 3;
                 // do not explicitly disconnect every time as the condition described is rare, so ...
                 // ... check that there are no external peers (indicating a working socket) ...
                 HASH_ITER(hh, eee->known_peers, peer, tmp_peer)
@@ -2393,7 +2455,7 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
                 if(!cnt) {
                     // ... and then count the connection retries
                     (eee->close_socket_counter)++;
-                    if(eee->close_socket_counter >= N2N_CLOSE_SOCKET_COUNTER_MAX) {
+                    if(eee->close_socket_counter >= close_socket_counter_max) {
                         eee->close_socket_counter = 0;
                         supernode_disconnect(eee);
                     }
@@ -2493,6 +2555,7 @@ static int handle_PACKET (n2n_edge_t * eee,
             ++(eee->stats.rx_sup_broadcast);
 
         ++(eee->stats.rx_sup);
+        eee->close_socket_counter = 0;
         eee->last_sup = now;
         if(eee->current_supernode_rx_transport == N2N_RX_SUPERNODE_TRANSPORT_UDP)
             eee->last_udp_sup = now;
@@ -3360,6 +3423,8 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOC
                            edge_supernode_rx_transport_str(eee->current_supernode_rx_transport),
                            (unsigned int)eee->sup_attempts);
 
+                eee->close_socket_counter = 0;
+
                 if(eee->tcp_fallback_active && (eee->udp_sock >= 0) && (in_sock == eee->udp_sock))
                     edge_mark_udp_recovered(eee, "received UDP REGISTER_SUPER_ACK from supernode");
 
@@ -3953,8 +4018,7 @@ void edge_term (n2n_edge_t * eee) {
 
     resolve_cancel_thread(eee->resolve_parameter);
 
-    n2n_kcp_ctx_term(&eee->sn_kcp);
-    eee->sn_kcp_confirmed = 0;
+    edge_reset_supernode_kcp_state(eee, "edge termination");
 
     if(eee->sock >= 0)
         closesocket(eee->sock);
@@ -4061,6 +4125,7 @@ void edge_init_conf_defaults (n2n_edge_conf_t *conf) {
     conf->drop_multicast = 1;
     conf->allow_p2p = 1;
     conf->prefer_kcp = 1;
+    conf->allow_tcp_fallback = 1;
     conf->disable_pmtu_discovery = 1;
     conf->register_interval = REGISTER_SUPER_INTERVAL_DFL;
     conf->tuntap_ip_mode = TUNTAP_IP_MODE_SN_ASSIGN;
@@ -4124,6 +4189,8 @@ int edge_conf_add_supernode (n2n_edge_conf_t *conf, const char *ip_and_port) {
     int rv = -1;
 
     sock = (n2n_sock_t*)calloc(1,sizeof(n2n_sock_t));
+    if(sock)
+        sock->family = (uint8_t)AF_INVALID;
     rv = supernode2sock(sock, ip_and_port);
 
     if(rv < -2) { /* we accept resolver failure as it might resolve later */

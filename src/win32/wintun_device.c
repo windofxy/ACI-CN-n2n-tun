@@ -68,13 +68,6 @@ static BOOL g_WintunInitialized = FALSE;
  */
 /* Maximum number of IP-to-MAC entries in the neighbor cache */
 #define N2N_NEIGHBOR_CACHE_SIZE 32
-#define N2N_WINTUN_PENDING_FRAME_LIMIT 256
-
-typedef struct _N2N_PENDING_FRAME {
-    struct _N2N_PENDING_FRAME *next;
-    uint16_t len;
-    uint8_t data[1];
-} N2N_PENDING_FRAME;
 
 typedef struct _N2N_WINTUN_CONTEXT {
     WINTUN_ADAPTER_HANDLE adapter;
@@ -105,10 +98,6 @@ typedef struct _N2N_WINTUN_CONTEXT {
     } neighbor_cache[N2N_NEIGHBOR_CACHE_SIZE];
     int neighbor_count;
     CRITICAL_SECTION neighbor_cs;
-    N2N_PENDING_FRAME *pending_head;
-    N2N_PENDING_FRAME *pending_tail;
-    uint32_t pending_count;
-    CRITICAL_SECTION pending_cs;
 } N2N_WINTUN_CONTEXT;
 
 static BOOL neighbor_lookup(N2N_WINTUN_CONTEXT* ctx,
@@ -1187,12 +1176,8 @@ int wintun_open(_Out_ tuntap_dev* device,
     InitializeCriticalSection(&ctx->send_cs);
     InitializeCriticalSection(&ctx->arp_cs);
     InitializeCriticalSection(&ctx->neighbor_cs);
-    InitializeCriticalSection(&ctx->pending_cs);
     ctx->arp_reply_len = 0;
     ctx->neighbor_count = 0;
-    ctx->pending_head = NULL;
-    ctx->pending_tail = NULL;
-    ctx->pending_count = 0;
 
     /* Set default MAC address (wintun doesn't expose MAC directly) */
     if (device_mac && device_mac[0]) {
@@ -1387,95 +1372,6 @@ static void format_ipv4_addr(const uint8_t *addr, char *out, size_t out_len) {
 static void format_ipv6_addr(const uint8_t *addr, char *out, size_t out_len) {
     if (!addr || !out || out_len == 0) return;
     inet_ntop(AF_INET6, addr, out, (int)out_len);
-}
-
-static void clear_pending_frames(N2N_WINTUN_CONTEXT *ctx) {
-    N2N_PENDING_FRAME *frame;
-    N2N_PENDING_FRAME *next;
-
-    if (!ctx) return;
-
-    EnterCriticalSection(&ctx->pending_cs);
-    frame = ctx->pending_head;
-    ctx->pending_head = NULL;
-    ctx->pending_tail = NULL;
-    ctx->pending_count = 0;
-    LeaveCriticalSection(&ctx->pending_cs);
-
-    while (frame) {
-        next = frame->next;
-        free(frame);
-        frame = next;
-    }
-}
-
-static int enqueue_pending_frame(N2N_WINTUN_CONTEXT *ctx, const uint8_t *frame_data, uint16_t frame_len) {
-    N2N_PENDING_FRAME *frame;
-
-    if (!ctx || !frame_data || frame_len == 0) return 0;
-
-    EnterCriticalSection(&ctx->pending_cs);
-    if (ctx->pending_count >= N2N_WINTUN_PENDING_FRAME_LIMIT) {
-        LeaveCriticalSection(&ctx->pending_cs);
-        traceEvent(TRACE_WARNING, "wintun_read: pending frame queue full, dropping oversized packet fragments");
-        return 0;
-    }
-    LeaveCriticalSection(&ctx->pending_cs);
-
-    frame = (N2N_PENDING_FRAME*)malloc(sizeof(*frame) + frame_len - 1);
-    if (!frame) {
-        traceEvent(TRACE_WARNING, "wintun_read: failed to allocate %u-byte pending frame", (unsigned)frame_len);
-        return 0;
-    }
-
-    frame->next = NULL;
-    frame->len = frame_len;
-    memcpy(frame->data, frame_data, frame_len);
-
-    EnterCriticalSection(&ctx->pending_cs);
-    if (ctx->pending_tail) {
-        ctx->pending_tail->next = frame;
-    } else {
-        ctx->pending_head = frame;
-    }
-    ctx->pending_tail = frame;
-    ctx->pending_count++;
-    LeaveCriticalSection(&ctx->pending_cs);
-
-    return 1;
-}
-
-static int dequeue_pending_frame(N2N_WINTUN_CONTEXT *ctx, unsigned char *buf, int len) {
-    N2N_PENDING_FRAME *frame;
-    int frame_len;
-
-    if (!ctx || !buf || len <= 0) return 0;
-
-    EnterCriticalSection(&ctx->pending_cs);
-    frame = ctx->pending_head;
-    if (!frame) {
-        LeaveCriticalSection(&ctx->pending_cs);
-        return 0;
-    }
-    ctx->pending_head = frame->next;
-    if (!ctx->pending_head) {
-        ctx->pending_tail = NULL;
-    }
-    if (ctx->pending_count > 0) {
-        ctx->pending_count--;
-    }
-    LeaveCriticalSection(&ctx->pending_cs);
-
-    frame_len = frame->len;
-    if (frame_len > len) {
-        traceEvent(TRACE_WARNING, "wintun_read: pending frame too large for caller buffer (%d > %d), dropping", frame_len, len);
-        free(frame);
-        return 0;
-    }
-
-    memcpy(buf, frame->data, frame_len);
-    free(frame);
-    return frame_len;
 }
 
 static int build_eth_frame_for_ip(N2N_WINTUN_CONTEXT *ctx, uint16_t ethertype,
@@ -1684,16 +1580,10 @@ static int inject_icmpv6_packet_too_big(N2N_WINTUN_CONTEXT *ctx, const uint8_t *
     return ok;
 }
 
-static int fragment_ipv4_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, size_t pkt_len,
-                                unsigned char *buf, int len) {
+static int handle_oversized_ipv4_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, size_t pkt_len) {
     size_t ihl;
     uint16_t total_len;
     uint16_t frag_field;
-    uint16_t frag_offset_units;
-    uint16_t max_payload;
-    size_t payload_len;
-    size_t payload_cursor;
-    uint32_t fragments = 0;
     char src_ip[INET_ADDRSTRLEN];
     char dst_ip[INET_ADDRSTRLEN];
 
@@ -1708,8 +1598,6 @@ static int fragment_ipv4_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, siz
     }
 
     frag_field = read_be16(pkt + 6);
-    frag_offset_units = (uint16_t)(frag_field & 0x1FFFu);
-    payload_len = total_len - (uint16_t)ihl;
 
     format_ipv4_addr(pkt + 12, src_ip, sizeof(src_ip));
     format_ipv4_addr(pkt + 16, dst_ip, sizeof(dst_ip));
@@ -1722,85 +1610,28 @@ static int fragment_ipv4_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, siz
         return 0;
     }
 
-    max_payload = (uint16_t)(((ctx->mtu - (unsigned)ihl) / 8u) * 8u);
-    if (max_payload == 0) {
-        traceEvent(TRACE_WARNING,
-                   "wintun_read: oversized IPv4 packet has zero fragment payload budget (ip_len=%u ihl=%u mtu=%u proto=%u src=%s dst=%s)",
-                   (unsigned)total_len, (unsigned)ihl, ctx->mtu, (unsigned)pkt[9], src_ip, dst_ip);
-        inject_icmpv4_frag_needed(ctx, pkt, total_len, ihl);
-        return 0;
-    }
-
-    payload_cursor = 0;
-    while (payload_cursor < payload_len) {
-        size_t frag_payload_len = payload_len - payload_cursor;
-        size_t frag_total_len;
-        uint8_t *frag_pkt;
-        uint8_t frame_buf[N2N_PKT_BUF_SIZE];
-        uint16_t new_frag_field;
-        int frame_len;
-
-        if (frag_payload_len > max_payload) {
-            frag_payload_len = max_payload;
-        }
-
-        frag_total_len = ihl + frag_payload_len;
-        frag_pkt = (uint8_t*)calloc(1, frag_total_len);
-        if (!frag_pkt) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        memcpy(frag_pkt, pkt, ihl);
-        memcpy(frag_pkt + ihl, pkt + ihl + payload_cursor, frag_payload_len);
-        write_be16(frag_pkt + 2, (uint16_t)frag_total_len);
-
-        new_frag_field = (uint16_t)((frag_offset_units + (payload_cursor / 8u)) & 0x1FFFu);
-        if ((payload_cursor + frag_payload_len) < payload_len || (frag_field & 0x2000u)) {
-            new_frag_field |= 0x2000u;
-        }
-        write_be16(frag_pkt + 6, new_frag_field);
-        write_be16(frag_pkt + 10, 0);
-        write_be16(frag_pkt + 10, ones_complement_checksum(frag_pkt, ihl));
-
-        frame_len = build_eth_frame_for_ip(ctx, N2N_ETHERTYPE_IPV4, frag_pkt, frag_total_len, frame_buf, sizeof(frame_buf));
-        free(frag_pkt);
-        if (frame_len <= 0) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        if (!enqueue_pending_frame(ctx, frame_buf, (uint16_t)frame_len)) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        fragments++;
-        payload_cursor += frag_payload_len;
-    }
-
-    traceEvent(TRACE_DEBUG,
-               "wintun_read: oversized IPv4 packet ip_len=%u ihl=%u df=%u frag_offset=%u proto=%u src=%s dst=%s action=fragmented fragments=%u mtu=%u",
+    if (inject_icmpv4_frag_needed(ctx, pkt, total_len, ihl)) {
+        traceEvent(TRACE_DEBUG,
+               "wintun_read: oversized IPv4 packet ip_len=%u ihl=%u df=%u frag_offset=%u proto=%u src=%s dst=%s action=icmp_frag_needed mtu=%u",
                (unsigned)total_len, (unsigned)ihl, (unsigned)((frag_field & 0x4000u) ? 1 : 0),
-               (unsigned)(frag_offset_units * 8u), (unsigned)pkt[9], src_ip, dst_ip,
-               (unsigned)fragments, ctx->mtu);
+               (unsigned)((frag_field & 0x1FFFu) * 8u), (unsigned)pkt[9], src_ip, dst_ip, ctx->mtu);
+    } else {
+        traceEvent(TRACE_WARNING,
+               "wintun_read: oversized IPv4 packet ip_len=%u ihl=%u df=%u frag_offset=%u proto=%u src=%s dst=%s action=icmp_frag_needed_failed mtu=%u",
+               (unsigned)total_len, (unsigned)ihl, (unsigned)((frag_field & 0x4000u) ? 1 : 0),
+               (unsigned)((frag_field & 0x1FFFu) * 8u), (unsigned)pkt[9], src_ip, dst_ip, ctx->mtu);
+    }
 
-    return dequeue_pending_frame(ctx, buf, len);
+    return 0;
 }
 
-static int fragment_ipv6_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, size_t pkt_len,
-                                unsigned char *buf, int len) {
+static int handle_oversized_ipv6_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, size_t pkt_len) {
     uint16_t payload_len_hdr;
     size_t ipv6_total_len;
     uint8_t next_header;
     size_t cursor;
     size_t frag_insert_offset;
     size_t prev_next_header_offset;
-    size_t fragmentable_len;
-    size_t max_fragmentable;
-    size_t data_offset;
-    uint32_t identification;
-    uint32_t fragments = 0;
     char src_ip[INET6_ADDRSTRLEN];
     char dst_ip[INET6_ADDRSTRLEN];
 
@@ -1841,96 +1672,46 @@ static int fragment_ipv6_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *pkt, siz
 
     if (ctx->mtu <= (frag_insert_offset + 8u)) {
         if (inject_icmpv6_packet_too_big(ctx, pkt, ipv6_total_len)) {
-            traceEvent(TRACE_WARNING, "wintun_read: oversized IPv6 packet exceeded MTU and was answered with ICMPv6 PTB");
+            traceEvent(TRACE_DEBUG, "wintun_read: oversized IPv6 packet exceeded MTU and was answered with ICMPv6 PTB");
+        } else {
+            traceEvent(TRACE_WARNING, "wintun_read: oversized IPv6 packet exceeded MTU but ICMPv6 PTB injection failed");
         }
         return 0;
     }
 
-    max_fragmentable = ((size_t)(ctx->mtu - (unsigned)(frag_insert_offset + 8u)) / 8u) * 8u;
-    if (max_fragmentable == 0) {
-        if (inject_icmpv6_packet_too_big(ctx, pkt, ipv6_total_len)) {
-            traceEvent(TRACE_WARNING, "wintun_read: oversized IPv6 packet had no fragment budget and was answered with ICMPv6 PTB");
-        }
-        return 0;
-    }
-
-    fragmentable_len = ipv6_total_len - frag_insert_offset;
-    data_offset = 0;
-    identification = (uint32_t)n2n_rand();
     format_ipv6_addr(pkt + 8, src_ip, sizeof(src_ip));
     format_ipv6_addr(pkt + 24, dst_ip, sizeof(dst_ip));
 
-    while (data_offset < fragmentable_len) {
-        size_t frag_data_len = fragmentable_len - data_offset;
-        size_t new_payload_len;
-        size_t new_total_len;
-        uint8_t *frag_pkt;
-        uint8_t frame_buf[N2N_PKT_BUF_SIZE];
-        uint16_t frag_offset_field;
-        int frame_len;
-
-        if (frag_data_len > max_fragmentable) {
-            frag_data_len = max_fragmentable;
-        }
-
-        new_payload_len = (frag_insert_offset - 40u) + 8u + frag_data_len;
-        new_total_len = 40u + new_payload_len;
-        frag_pkt = (uint8_t*)calloc(1, new_total_len);
-        if (!frag_pkt) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        memcpy(frag_pkt, pkt, frag_insert_offset);
-        frag_pkt[prev_next_header_offset] = IPV6_NEXT_FRAGMENT;
-        write_be16(frag_pkt + 4, (uint16_t)new_payload_len);
-
-        frag_pkt[frag_insert_offset + 0] = next_header;
-        frag_pkt[frag_insert_offset + 1] = 0;
-        frag_offset_field = (uint16_t)(((data_offset / 8u) & 0x1FFFu) << 3);
-        if ((data_offset + frag_data_len) < fragmentable_len) {
-            frag_offset_field |= 0x0001u;
-        }
-        write_be16(frag_pkt + frag_insert_offset + 2, frag_offset_field);
-        write_be32(frag_pkt + frag_insert_offset + 4, identification);
-        memcpy(frag_pkt + frag_insert_offset + 8, pkt + frag_insert_offset + data_offset, frag_data_len);
-
-        frame_len = build_eth_frame_for_ip(ctx, N2N_ETHERTYPE_IPV6, frag_pkt, new_total_len, frame_buf, sizeof(frame_buf));
-        free(frag_pkt);
-        if (frame_len <= 0) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        if (!enqueue_pending_frame(ctx, frame_buf, (uint16_t)frame_len)) {
-            clear_pending_frames(ctx);
-            return 0;
-        }
-
-        fragments++;
-        data_offset += frag_data_len;
+    if (inject_icmpv6_packet_too_big(ctx, pkt, ipv6_total_len)) {
+        traceEvent(TRACE_DEBUG,
+               "wintun_read: oversized IPv6 packet ip_len=%u next=%u src=%s dst=%s action=icmpv6_ptb mtu=%u frag_insert=%u",
+               (unsigned)ipv6_total_len, (unsigned)next_header, src_ip, dst_ip,
+               ctx->mtu, (unsigned)frag_insert_offset);
+    } else {
+        traceEvent(TRACE_WARNING,
+               "wintun_read: oversized IPv6 packet ip_len=%u next=%u src=%s dst=%s action=icmpv6_ptb_failed mtu=%u frag_insert=%u",
+               (unsigned)ipv6_total_len, (unsigned)next_header, src_ip, dst_ip,
+               ctx->mtu, (unsigned)frag_insert_offset);
     }
 
-    traceEvent(TRACE_DEBUG,
-               "wintun_read: oversized IPv6 packet ip_len=%u next=%u src=%s dst=%s action=fragmented fragments=%u mtu=%u frag_insert=%u",
-               (unsigned)ipv6_total_len, (unsigned)next_header, src_ip, dst_ip,
-               (unsigned)fragments, ctx->mtu, (unsigned)frag_insert_offset);
-
-    return dequeue_pending_frame(ctx, buf, len);
+    return 0;
 }
 
 static int handle_oversized_ip_packet(N2N_WINTUN_CONTEXT *ctx, const uint8_t *packet, size_t packet_size,
                                       unsigned char *buf, int len) {
     uint8_t ip_version;
 
-    if (!ctx || !packet || packet_size == 0 || !buf) return 0;
+    (void)buf;
+    (void)len;
+
+    if (!ctx || !packet || packet_size == 0) return 0;
 
     ip_version = (uint8_t)(packet[0] >> 4);
     if (ip_version == 4) {
-        return fragment_ipv4_packet(ctx, packet, packet_size, buf, len);
+        return handle_oversized_ipv4_packet(ctx, packet, packet_size);
     }
     if (ip_version == 6) {
-        return fragment_ipv6_packet(ctx, packet, packet_size, buf, len);
+        return handle_oversized_ipv6_packet(ctx, packet, packet_size);
     }
 
     traceEvent(TRACE_WARNING, "wintun_read: unknown oversized IP version %u, dropping", (unsigned)ip_version);
@@ -1999,14 +1780,6 @@ int wintun_read(_In_ tuntap_dev* device, _Out_ unsigned char* buf, _In_ int len)
         return reply_len;
     }
     LeaveCriticalSection(&ctx->arp_cs);
-
-    {
-        int pending_len = dequeue_pending_frame(ctx, buf, len);
-        if (pending_len > 0) {
-            traceEvent(TRACE_DEBUG, "wintun_read: returning queued frame (%d bytes)", pending_len);
-            return pending_len;
-        }
-    }
 
     /* Try to receive a packet */
     SetLastError(0);
@@ -2213,8 +1986,6 @@ void wintun_close(_In_ tuntap_dev* device) {
     DeleteCriticalSection(&ctx->send_cs);
     DeleteCriticalSection(&ctx->arp_cs);
     DeleteCriticalSection(&ctx->neighbor_cs);
-    clear_pending_frames(ctx);
-    DeleteCriticalSection(&ctx->pending_cs);
     free(ctx);
 
     device->device_handle = NULL;
