@@ -82,13 +82,8 @@ enum n2n_sn_transport_policy {
 
 static int packet_transport_policy_from_flags (uint16_t flags) {
 
-    if(flags & N2N_FLAGS_PACKET_INNER_TCP)
-        return N2N_SN_TRANSPORT_POLICY_FORCE_RAW_UDP;
-
-    if(flags & N2N_FLAGS_PACKET_INNER_UDP)
-        return N2N_SN_TRANSPORT_POLICY_PREFER_KCP;
-
-    return N2N_SN_TRANSPORT_POLICY_DEFAULT;
+    (void)flags;
+    return N2N_SN_TRANSPORT_POLICY_FORCE_RAW_UDP;
 }
 
 
@@ -604,7 +599,7 @@ static ssize_t sendto_fd (n2n_sn_t *sss,
 
         fill_n2nsock(&remote, socket);
         traceEvent(TRACE_DEBUG,
-                   "routing %u-byte payload to edge [%s] via raw UDP due to INNER_TCP hint",
+                   "routing %u-byte payload to edge [%s] via raw UDP (data-plane KCP disabled)",
                    (unsigned int)pktsize,
                    sock_to_cstr(sockbuf, &remote));
     }

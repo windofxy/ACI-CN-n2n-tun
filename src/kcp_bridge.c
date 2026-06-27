@@ -78,6 +78,8 @@ static uint8_t *n2n_kcp_edge_confirm_flag (n2n_edge_t *eee, n2n_kcp_channel_t ch
     return (channel == N2N_KCP_CHANNEL_DATA) ? &eee->sn_kcp_data_confirmed : &eee->sn_kcp_ctrl_confirmed;
 }
 
+static void n2n_kcp_sn_drop_ctx (n2n_sn_t *sss, n2n_kcp_ctx_t *ctx, n2n_kcp_channel_t channel, const char *reason);
+
 
 static n2n_kcp_ctx_t **n2n_kcp_sn_table (n2n_sn_t *sss, n2n_kcp_channel_t channel) {
     if(!sss)
@@ -338,8 +340,15 @@ static int n2n_kcp_edge_setup_with_conv (n2n_edge_t *eee, const n2n_sock_t *remo
     if(!eee || !ctx || !confirmed || !remote || eee->udp_sock < 0)
         return 0;
 
-    if(ctx->active && sock_equal(&ctx->remote_sock, remote))
-        return 0;
+    if(ctx->active && ctx->kcp && sock_equal(&ctx->remote_sock, remote)) {
+        if(ctx->kcp->state != (IUINT32)-1)
+            return 0;
+
+        traceEvent(TRACE_DEBUG,
+                   "recreating dead edge %s KCP session to supernode [%s] before send",
+                   n2n_kcp_channel_str(channel),
+                   sock_to_cstr(sockbuf, remote));
+    }
 
     if(ctx->active || *confirmed) {
         traceEvent(TRACE_NORMAL,
@@ -391,6 +400,7 @@ int n2n_kcp_edge_setup (n2n_edge_t *eee, const n2n_sock_t *remote, n2n_kcp_chann
 
 int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2n_sock_t *dest, n2n_kcp_channel_t channel) {
     n2n_kcp_ctx_t *ctx = n2n_kcp_edge_ctx(eee, channel);
+    n2n_sock_str_t sockbuf;
 
     if(!eee || !ctx || !buf || !dest || eee->udp_sock < 0)
         return -1;
@@ -400,6 +410,14 @@ int n2n_kcp_edge_send (n2n_edge_t *eee, const uint8_t *buf, size_t len, const n2
 
     if(n2n_kcp_edge_setup(eee, dest, channel) != 0)
         return -1;
+
+    if(!ctx->kcp || (ctx->kcp->state == (IUINT32)-1)) {
+        traceEvent(TRACE_DEBUG,
+                   "skipping dead %s KCP session to supernode [%s] during send",
+                   n2n_kcp_channel_str(channel),
+                   sock_to_cstr(sockbuf, dest));
+        return -1;
+    }
 
     if(ikcp_send(ctx->kcp, (const char*)buf, (int)len) < 0)
         return -1;
@@ -511,12 +529,16 @@ void n2n_kcp_edge_update (n2n_edge_t *eee) {
     now_ms = n2n_kcp_now_ms();
 
     ctx = n2n_kcp_edge_ctx(eee, N2N_KCP_CHANNEL_CTRL);
-    if(ctx && ctx->active && ctx->kcp)
+    if(ctx && ctx->active && ctx->kcp) {
         ikcp_update(ctx->kcp, now_ms);
+        ikcp_flush(ctx->kcp);
+    }
 
     ctx = n2n_kcp_edge_ctx(eee, N2N_KCP_CHANNEL_DATA);
-    if(ctx && ctx->active && ctx->kcp)
+    if(ctx && ctx->active && ctx->kcp) {
         ikcp_update(ctx->kcp, now_ms);
+        ikcp_flush(ctx->kcp);
+    }
 }
 
 int n2n_kcp_edge_wait_timeout_ms (const n2n_edge_t *eee, int default_ms) {
@@ -561,6 +583,13 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_send_ctx (n2n_sn_t *sss, const n2n_sock_t 
     n2n_kcp_ctx_t *ctx = n2n_kcp_sn_find_ctx(sss, remote, channel);
 
     if(ctx && ctx->active) {
+        if(ctx->kcp && ctx->kcp->state == (IUINT32)-1) {
+            n2n_kcp_sn_drop_ctx(sss, ctx, channel, "supernode attempted to reuse dead KCP session");
+            ctx = NULL;
+        }
+    }
+
+    if(ctx && ctx->active) {
         if(actual_channel)
             *actual_channel = channel;
         return ctx;
@@ -568,6 +597,13 @@ static n2n_kcp_ctx_t *n2n_kcp_sn_find_send_ctx (n2n_sn_t *sss, const n2n_sock_t 
 
     channel = n2n_kcp_other_channel(channel);
     ctx = n2n_kcp_sn_find_ctx(sss, remote, channel);
+    if(ctx && ctx->active) {
+        if(ctx->kcp && ctx->kcp->state == (IUINT32)-1) {
+            n2n_kcp_sn_drop_ctx(sss, ctx, channel, "supernode attempted to reuse dead KCP session");
+            ctx = NULL;
+        }
+    }
+
     if(ctx && ctx->active) {
         if(actual_channel)
             *actual_channel = channel;
@@ -687,6 +723,14 @@ int n2n_kcp_sn_send (n2n_sn_t *sss, SOCKET socket_fd, const struct sockaddr *soc
     if(!ctx)
         return -1;
 
+    if(!ctx->kcp || (ctx->kcp->state == (IUINT32)-1)) {
+        traceEvent(TRACE_DEBUG,
+                   "skipping dead %s KCP session to edge [%s] during send",
+                   n2n_kcp_channel_str(actual_channel),
+                   sock_to_cstr(sockbuf, &remote));
+        return -1;
+    }
+
     traceEvent(TRACE_DEBUG,
                "sending %u-byte payload to edge [%s] over %s KCP",
                (unsigned int)pktsize,
@@ -777,8 +821,10 @@ void n2n_kcp_sn_update (n2n_sn_t *sss) {
             continue;
 
         HASH_ITER(hh, *table, ctx, tmp) {
-            if(ctx->kcp)
+            if(ctx->kcp) {
                 ikcp_update(ctx->kcp, now_ms);
+                ikcp_flush(ctx->kcp);
+            }
             if(ctx->kcp && ctx->kcp->state == (IUINT32)-1) {
                 n2n_kcp_sn_drop_ctx(sss, ctx, channel, "KCP session reached dead_link threshold");
                 continue;

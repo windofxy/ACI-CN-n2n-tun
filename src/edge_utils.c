@@ -44,6 +44,7 @@
 #define N2N_TCP_REGISTER_SOFT_RETRIES 2
 #define N2N_KCP_PRIME_BURST_SENDS 1
 #define N2N_SUPERNODE_UDP_ACTIVITY_GRACE_SECS 2
+#define N2N_DATA_KCP_IDLE_REAP_SECS 100
 #define N2N_TAP_TX_QUEUE_MAX_PACKETS 1024
 #define N2N_TAP_TX_QUEUE_MAX_BYTES (4 * 1024 * 1024)
 #define N2N_TAP_TX_DRAIN_BUDGET 128
@@ -928,6 +929,38 @@ static void edge_handle_dead_kcp_session (n2n_edge_t *eee) {
 }
 
 
+static void edge_handle_idle_data_kcp_session (n2n_edge_t *eee, time_t now) {
+
+    int waitsnd;
+    time_t idle_secs;
+
+    if(!eee || edge_transport_is_forced_tcp(eee) || edge_transport_uses_tcp(eee))
+        return;
+
+    if(!eee->sn_kcp_data.active || !eee->sn_kcp_data.kcp || !eee->sn_kcp_data_confirmed)
+        return;
+
+    if(eee->sn_kcp_data.kcp->state == (IUINT32)-1)
+        return;
+
+    idle_secs = now - eee->sn_kcp_data.last_seen;
+    if(idle_secs <= N2N_DATA_KCP_IDLE_REAP_SECS)
+        return;
+
+    waitsnd = ikcp_waitsnd(eee->sn_kcp_data.kcp);
+    if(waitsnd != 0)
+        return;
+
+    traceEvent(TRACE_DEBUG,
+               "releasing idle data KCP session to supernode [%s]: idle=%u s waitsnd=%d",
+               supernode_ip(eee),
+               (unsigned int)idle_secs,
+               waitsnd);
+    n2n_kcp_ctx_term(&eee->sn_kcp_data);
+    eee->sn_kcp_data_confirmed = 0;
+}
+
+
 static void supernode_apply_socket_options (n2n_edge_t *eee, SOCKET sockfd) {
 
     int sockopt;
@@ -1474,10 +1507,8 @@ static uint16_t edge_packet_transport_flags (const uint8_t *tap_pkt, size_t len)
 
 static int edge_transport_policy_from_flags (uint16_t flags) {
 
-    if(flags & N2N_FLAGS_PACKET_INNER_TCP)
-        return N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP;
-
-    return N2N_EDGE_TRANSPORT_POLICY_DEFAULT;
+    (void)flags;
+    return N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP;
 }
 
 
@@ -1977,15 +2008,9 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
             }
         } else if(transport_policy == N2N_EDGE_TRANSPORT_POLICY_FORCE_RAW_UDP) {
             traceEvent(TRACE_DEBUG,
-                       "routing %u-byte payload to supernode [%s] via raw UDP due to INNER_TCP hint",
+                       "routing %u-byte payload to supernode [%s] via raw UDP (data-plane KCP disabled)",
                        (unsigned int)len,
                        sock_to_cstr(sockbuf, n2ndest));
-        } else if(eee->conf.prefer_kcp && eee->sn_kcp_ctrl_confirmed) {
-            int kcp_sent = n2n_kcp_edge_send(eee, (const uint8_t*)buf, len, n2ndest, N2N_KCP_CHANNEL_DATA);
-            if(kcp_sent >= 0) {
-                traceEvent(TRACE_DEBUG, "sent=%d", kcp_sent);
-                return kcp_sent;
-            }
         }
     }
 
@@ -4211,6 +4236,7 @@ int run_edge_loop (n2n_edge_t *eee) {
 
         // finished processing select data
         n2n_kcp_edge_update(eee);
+        edge_handle_idle_data_kcp_session(eee, now);
         edge_handle_dead_kcp_session(eee);
         update_supernode_reg(eee, now);
 
